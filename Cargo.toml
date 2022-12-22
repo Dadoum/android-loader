@@ -1,0 +1,14 @@
+[package]
+name = "android-loader"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytemuck = "1.12.3"
+elfloader = { path = "./rust-elfloader" }
+libc = "0.2.79"
+memmap2 = "0.5.8"
+page_size = "0.4.2"
+xmas-elf = "0.8"
