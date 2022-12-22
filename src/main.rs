@@ -157,19 +157,19 @@ impl ElfLoader for AndroidLoader {
                 RelocationType::x86(relocation) => {
                     match relocation {
                         x86::RelocationTypes::R_386_32 => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                         x86::RelocationTypes::R_386_GLOB_DAT => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                         x86::RelocationTypes::R_386_JMP_SLOT => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                         x86::RelocationTypes::R_386_RELATIVE => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                         _ => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                     }
                 }
@@ -206,7 +206,7 @@ impl ElfLoader for AndroidLoader {
                 RelocationType::Arm(relocation) => {
                     match relocation {
                         _ => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                     }
                 }
@@ -214,7 +214,7 @@ impl ElfLoader for AndroidLoader {
                 RelocationType::AArch64(relocation) => {
                     match relocation {
                         _ => {
-                            Ok(())
+                            Err(ElfLoaderErr::UnsupportedRelocationEntry)
                         }
                     }
                 }
