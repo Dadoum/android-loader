@@ -8,7 +8,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "elfloader",
- "libc",
  "memmap2",
  "page_size",
  "xmas-elf",
