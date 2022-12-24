@@ -23,7 +23,7 @@ pub fn page_end(v: usize) -> usize {
 
 struct AndroidLoader {
     current_map: Option<MmapMut>,
-    loaded_maps: Vec<(Mmap)>
+    loaded_maps: Vec<Mmap>
 }
 
 impl AndroidLoader {
@@ -79,22 +79,8 @@ impl AndroidLoader {
     }
 }
 
-extern "C" fn unlinked_symbol() {
+extern "C" fn undefined_symbol_handler() {
     panic!("Undefined function called.");
-}
-
-fn elf_hash(str: &str) -> u32 {
-    let mut h: u32 = 0;
-    let mut g: u32;
-
-    for char in str.chars() {
-        h = (h << 4) + (char as u32);
-        g = h & 0xf0000000;
-        h ^= g;
-        h ^= g >> 24;
-    }
-
-    h
 }
 
 impl ElfLoader for AndroidLoader {
@@ -175,17 +161,10 @@ impl ElfLoader for AndroidLoader {
                 }
 
                 RelocationType::x86_64(relocation) => {
-                    let symbol = unlinked_symbol as extern "C" fn();
+                    let symbol = undefined_symbol_handler as extern "C" fn();
                     match relocation {
-                        x86_64::RelocationTypes::R_AMD64_JMP_SLOT | x86_64::RelocationTypes::R_AMD64_GLOB_DAT => {
-                            let num = symbol as u64;
-                            let mut data: [u8; 8] = bytemuck::cast(num);
-                            map[offset..offset + 8].copy_from_slice(&data);
-                            Ok(())
-                        }
-                        x86_64::RelocationTypes::R_AMD64_64 => {
+                        x86_64::RelocationTypes::R_AMD64_JMP_SLOT | x86_64::RelocationTypes::R_AMD64_GLOB_DAT | x86_64::RelocationTypes::R_AMD64_64 => {
                             let num = symbol as u64 + entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?;
-                            println!("absolute {:x} addend: {}", num, entry.addend.unwrap());
                             let mut data: [u8; 8] = bytemuck::cast(num);
                             map[offset..offset + 8].copy_from_slice(&data);
                             Ok(())
@@ -228,7 +207,6 @@ impl ElfLoader for AndroidLoader {
 }
 
 fn main() {
-    unsafe { signal(SIGSEGV, SIG_DFL); }
     let mut loader = AndroidLoader::new();
     let core_adi_file = fs::read("lib/x86_64/libCoreADI.so").expect("Cannot read CoreADI");
     let core_adi = ElfBinary::new(core_adi_file.as_slice()).expect("Failed preliminary load of CoreADI");
