@@ -2,6 +2,7 @@ use std::ffi::{c_void, CString};
 use elfloader::{ElfBinary, ElfLoader, ElfLoaderErr, Flags, LoadableHeaders, RelocationEntry, RelocationType, VAddr};
 use memmap2::{MmapMut, MmapOptions};
 use std::fs;
+use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use elfloader::arch::{x86, x86_64, arm, aarch64};
 use libc::{c_char, dlopen, RTLD_LAZY};
@@ -102,7 +103,9 @@ struct AndroidLibraryMut {
 }
 
 impl AndroidLoader {
-    fn absolute_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: u64) {
+    const WORD_SIZE: usize = size_of::<usize>();
+
+    fn absolute_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: usize) {
         let offset = entry.offset as usize;
 
         let symbol = match self.symbol_finder(library.symbols[entry.index as usize].name.as_str()) {
@@ -110,18 +113,19 @@ impl AndroidLoader {
             None => undefined_symbol_handler as extern "C" fn()
         };
 
-        let num = symbol as u64 + addend;
-        let data: [u8; 8] = bytemuck::cast(num);
-        library.memory_map[offset..offset + 8].copy_from_slice(&data);
+        let num = symbol as usize + addend;
+        let data: [u8; AndroidLoader::WORD_SIZE] = bytemuck::cast(num);
+        library.memory_map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
+        // unsafe { *((library.memory_map.as_mut_ptr() as u64 + offset as u64) as *mut usize) = num; }
     }
 
-    fn relative_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: u64) {
+    fn relative_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: usize) {
         let offset = entry.offset as usize;
         let map = &mut library.memory_map;
 
-        let num = map.as_mut_ptr() as u64 + addend;
-        let data: [u8; 8] = bytemuck::cast(num);
-        map[offset..offset + 8].copy_from_slice(&data);
+        let num = map.as_mut_ptr() as usize + addend;
+        let data: [u8; AndroidLoader::WORD_SIZE] = bytemuck::cast(num);
+        map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
     }
 }
 
@@ -203,7 +207,7 @@ impl ElfLoader<AndroidLibraryMut> for AndroidLoader {
             }
 
             RelocationType::x86_64(relocation) => {
-                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?;
+                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)? as usize;
                 match relocation {
                     x86_64::RelocationTypes::R_AMD64_JMP_SLOT |
                     x86_64::RelocationTypes::R_AMD64_GLOB_DAT |
@@ -228,7 +232,7 @@ impl ElfLoader<AndroidLibraryMut> for AndroidLoader {
             }
 
             RelocationType::AArch64(relocation) => {
-                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?;
+                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)? as usize;
                 match relocation {
                     aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT |
                     aarch64::RelocationTypes::R_AARCH64_GLOB_DAT  |
