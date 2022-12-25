@@ -31,6 +31,6 @@ mod tests {
         let identifier = "f213456789abcde0";
         let str = CString::new(identifier).unwrap();
         let len = identifier.len() as u32;
-        set_android_identifier(str.as_ptr(), len);
+        set_android_identifier(str.as_ptr() as *const i8, len);
     }
 }
