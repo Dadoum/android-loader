@@ -47,6 +47,7 @@ impl From<dlopen2::Error> for AndroidLoaderErr {
 
 impl AndroidLoader {
     pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader, AndroidLoaderErr> {
+        eprintln!("Page size: {}", page_size::get());
         Ok(AndroidLoader {
             symbol_loader,
             libc: Library::open_self()?
@@ -54,7 +55,6 @@ impl AndroidLoader {
     }
 
     extern "C" fn no_pthread() -> i32 {
-        println!("pthread: no crash plz");
         0
     }
 
@@ -120,20 +120,17 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         let mut maximum = usize::MIN;
 
         for header in load_headers {
-            match header.get_type() {
-                Ok(Type::Load) => {
-                    let start = page_start(header.virtual_addr() as usize);
-                    let end = page_end(start + max(header.file_size(), header.mem_size()) as usize);
+            if header.get_type() == Ok(Type::Load) {
+                let start = page_start(header.virtual_addr() as usize);
+                let end = page_end(start + max(header.file_size(), header.mem_size()) as usize);
 
-                    if start < minimum {
-                        minimum = start;
-                    }
-
-                    if end > maximum {
-                        maximum = end;
-                    }
+                if start < minimum {
+                    minimum = start;
                 }
-                _ => ()
+
+                if end > maximum {
+                    maximum = end;
+                }
             }
         }
 
@@ -173,48 +170,41 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
     }
 
     fn load(&self, library: &mut AndroidLibrary, program_header: &ProgramHeader, region: &[u8]) -> Result<(), ElfLoaderErr> {
-        let offset = program_header.offset() as usize;
+        // let offset = program_header.offset() as usize;
+        let virtual_addr = program_header.virtual_addr() as usize;
         let mem_size = program_header.mem_size() as usize;
-        // let program::Ph64(header) = program_header;
+        let file_size = program_header.file_size() as usize;
         let addr = library.memory_map.as_ptr() as usize;
-        println!("{:x} - {:x} ({})", page_start(addr + offset), page_end(addr + offset + mem_size), offset + mem_size);
-        library.memory_map[offset..offset + region.len()].copy_from_slice(region);
-
-
-        /*
-        unsafe {
-            let start = page_start(addr + offset);
-            let mapped = libc::mmap(
-                start as *mut c_void,
-                (page_end(addr + offset + mem_size) - start) as libc::size_t,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                MAP_FIXED|MAP_PRIVATE|MAP_ANON,
-                -1,
-                0
-            );
-            // if mapped == MAP_FAILED {
-            //     return Result::Err(ElfLoaderErr::ElfParser {
-            //         source: "AAAAAAAAAAAAAa"
-            //     });
-            // }
-
-        }
-        // */
+        print!("{:x} - {:x} (mem_sz: {}, file_sz: {}) [", page_start(addr + virtual_addr), page_end(addr + virtual_addr + mem_size), mem_size, file_size);
 
         let flags = program_header.flags();
         let mut prot = 0;
         if flags.is_read() {
+            print!("R");
             prot |= PROT_READ;
-        }
-        if flags.is_execute() {
-            prot |= PROT_EXEC;
+        } else {
+            print!("-");
         }
         if flags.is_write() {
+            print!("W");
             prot |= PROT_WRITE;
+        } else {
+            print!("-");
+        }
+        if flags.is_execute() {
+            println!("X]");
+            prot |= PROT_EXEC;
+        } else {
+            println!("-]");
+        }
+        library.memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(region);
+
+        if file_size < mem_size {
+
         }
 
         let addr = library.memory_map.as_ptr() as usize;
-        unsafe { libc::mprotect(page_start(addr + offset as usize) as *mut c_void, (page_end(addr + region.len()) - addr) as size_t, prot) };
+        unsafe { libc::mprotect(page_start(addr + virtual_addr) as *mut c_void, (page_end(addr + virtual_addr + file_size) - page_start(addr + virtual_addr)) as size_t, prot) };
         Ok(())
     }
 
@@ -237,9 +227,15 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 match relocation {
                     x86_64::RelocationTypes::R_AMD64_JMP_SLOT |
                     x86_64::RelocationTypes::R_AMD64_GLOB_DAT |
-                    x86_64::RelocationTypes::R_AMD64_64 => Ok(self.absolute_reloc(library, entry, addend)),
+                    x86_64::RelocationTypes::R_AMD64_64 => {
+                        self.absolute_reloc(library, entry, addend);
+                        Ok(())
+                    },
 
-                    x86_64::RelocationTypes::R_AMD64_RELATIVE => Ok(self.relative_reloc(library, entry, addend)),
+                    x86_64::RelocationTypes::R_AMD64_RELATIVE => {
+                        self.relative_reloc(library, entry, addend);
+                        Ok(())
+                    },
 
                     _ => Err(ElfLoaderErr::UnsupportedRelocationEntry)
                 }
@@ -262,9 +258,15 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 match relocation {
                     aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT |
                     aarch64::RelocationTypes::R_AARCH64_GLOB_DAT  |
-                    aarch64::RelocationTypes::R_AARCH64_ABS64 => Ok(self.absolute_reloc(library, entry, addend)),
+                    aarch64::RelocationTypes::R_AARCH64_ABS64 => {
+                        self.absolute_reloc(library, entry, addend);
+                        Ok(())
+                    },
 
-                    aarch64::RelocationTypes::R_AARCH64_RELATIVE => Ok(self.relative_reloc(library, entry, addend)),
+                    aarch64::RelocationTypes::R_AARCH64_RELATIVE => {
+                        self.relative_reloc(library, entry, addend);
+                        Ok(())
+                    },
 
                     _ => Err(ElfLoaderErr::UnsupportedRelocationEntry)
                 }

@@ -22,9 +22,6 @@ impl AndroidLibrary {
             }
         }
 
-        match symbol_value {
-            Some(val) => Some(unsafe { std::mem::transmute(self.memory_map.as_ptr() as usize + val) }),
-            None => None
-        }
+        symbol_value.map(|val| unsafe { std::mem::transmute(self.memory_map.as_ptr() as usize + val) })
     }
 }

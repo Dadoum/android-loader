@@ -1,7 +1,7 @@
 extern crate core;
 
-mod android_library;
-mod android_loader;
+pub mod android_library;
+pub mod android_loader;
 mod page_utils;
 
 #[cfg(test)]
@@ -19,7 +19,7 @@ mod tests {
         if name == "libCoreADI.so" {
             println!("Library requested: {}", name);
             let core_adi = Box::new(LOADER.load_library("lib/x86_64/libCoreADI.so").expect("Cannot load libCoreADI"));
-            std::mem::transmute(Box::leak(core_adi))
+            Box::leak(core_adi) as *mut AndroidLibrary as *mut c_void
         } else {
             null_mut()
         }
@@ -29,7 +29,7 @@ mod tests {
         let symbol = CStr::from_ptr(symbol).to_str().unwrap();
         println!("Symbol requested: {}", symbol);
         match handle.get_symbol(symbol) {
-            Some(func) => std::mem::transmute(func),
+            Some(func) => func as *mut c_void,
             None => null_mut()
         }
     }
@@ -47,12 +47,12 @@ mod tests {
         let store_services_core = LOADER.load_library("lib/x86_64/libstoreservicescore.so").expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");
-        let set_android_identifier: extern "C" fn(*const i8, u32) -> i32 = unsafe { std::mem::transmute(store_services_core.get_symbol("Sph98paBcz")) }; // Sph98paBcz abort
+        let set_android_identifier: extern "C" fn(*const c_char, u32) -> i32 = unsafe { std::mem::transmute(store_services_core.get_symbol("Sph98paBcz")) }; // Sph98paBcz abort
         // println!("{:p}", set_android_identifier as *const ());
         let identifier = "f213456789abcde0";
         let str = CString::new(identifier).unwrap();
         let len = identifier.len() as u32;
-        let ret = set_android_identifier(str.as_ptr() as *const i8, len);
+        let ret = set_android_identifier(str.as_ptr() as *const c_char, len);
         println!("Fin ? ADI returned {}", ret);
     }
 }
