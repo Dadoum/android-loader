@@ -2,7 +2,6 @@ extern crate core;
 
 pub mod android_library;
 pub mod android_loader;
-mod page_utils;
 
 #[cfg(test)]
 mod tests {

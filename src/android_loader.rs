@@ -1,13 +1,12 @@
 use crate::android_library::{AndroidLibrary, Symbol};
-use crate::page_utils::{page_end, page_start};
 use anyhow::Result;
 use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
 use elfloader::{
     ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType,
 };
-use libc::{size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
 use memmap2::MmapOptions;
+use region::Protection;
 use std::cmp::max;
 use std::ffi::c_void;
 use std::fs;
@@ -24,7 +23,6 @@ pub struct AndroidLoader {
 
 impl AndroidLoader {
     pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader> {
-        eprintln!("Page size: {}", page_size::get());
         Ok(AndroidLoader {
             symbol_loader,
             libc: Library::open_self()?,
@@ -94,8 +92,8 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
 
         for header in load_headers {
             if header.get_type() == Ok(Type::Load) {
-                let start = page_start(header.virtual_addr() as usize);
-                let end = page_end(start + max(header.file_size(), header.mem_size()) as usize);
+                let start = region::page::floor(header.virtual_addr() as *const ()) as usize;
+                let end = region::page::ceil((start as usize + max(header.file_size(), header.mem_size()) as usize) as *const ()) as usize;
 
                 if start < minimum {
                     minimum = start;
@@ -107,10 +105,10 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             }
         }
 
-        let alloc_start = page_start(minimum as usize);
-        debug_assert!(alloc_start <= minimum as usize);
-        let alloc_end = page_end(maximum as usize);
-        debug_assert!(alloc_end >= maximum as usize);
+        let alloc_start = region::page::floor(minimum as *const ()) as usize;
+        debug_assert!(alloc_start <= minimum);
+        let alloc_end = region::page::ceil(maximum as *const ()) as usize;
+        debug_assert!(alloc_end >= maximum);
 
         let dyn_symbol_section = elf_binary.file.find_section_by_name(".dynsym").unwrap();
         let dyn_symbol_table = dyn_symbol_section.get_data(&elf_binary.file).unwrap();
@@ -155,47 +153,35 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         let mem_size = program_header.mem_size() as usize;
         let file_size = program_header.file_size() as usize;
         let addr = library.memory_map.as_ptr() as usize;
-        print!(
-            "{:x} - {:x} (mem_sz: {}, file_sz: {}) [",
-            page_start(addr + virtual_addr),
-            page_end(addr + virtual_addr + mem_size),
-            mem_size,
-            file_size
-        );
+
+        let start_addr = region::page::floor((addr + virtual_addr) as *const c_void) as *mut c_void;
+        let end_addr = region::page::ceil((addr + virtual_addr + mem_size) as *const c_void);
+        print!("{:x} - {:x} (mem_sz: {}, file_sz: {}) [", start_addr as usize, end_addr as usize, mem_size, file_size);
 
         let flags = program_header.flags();
-        let mut prot = 0;
+        let mut prot = Protection::NONE.bits();
         if flags.is_read() {
             print!("R");
-            prot |= PROT_READ;
+            prot |= Protection::READ.bits();
         } else {
             print!("-");
         }
         if flags.is_write() {
             print!("W");
-            prot |= PROT_WRITE;
+            prot |= Protection::WRITE.bits();
         } else {
             print!("-");
         }
         if flags.is_execute() {
             println!("X]");
-            prot |= PROT_EXEC;
+            prot |= Protection::EXECUTE.bits();
         } else {
             println!("-]");
         }
         library.memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(region);
 
-        if file_size < mem_size {}
+        unsafe { region::protect(start_addr, end_addr as usize - start_addr as usize, Protection::from_bits_truncate(prot)).unwrap() };
 
-        let addr = library.memory_map.as_ptr() as usize;
-        unsafe {
-            libc::mprotect(
-                page_start(addr + virtual_addr) as *mut c_void,
-                (page_end(addr + virtual_addr + file_size) - page_start(addr + virtual_addr))
-                    as size_t,
-                prot,
-            )
-        };
         Ok(())
     }
 
