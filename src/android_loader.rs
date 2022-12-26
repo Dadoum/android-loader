@@ -1,12 +1,13 @@
-use std::ffi::{c_void, CString};
-use elfloader::{ElfBinary, ElfLoader, ElfLoaderErr, Flags, LoadableHeaders, RelocationEntry, RelocationType, VAddr};
-use memmap2::{MmapMut, MmapOptions};
+use std::cmp::max;
+use std::ffi::c_void;
+use elfloader::{ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType};
+use memmap2::MmapOptions;
 use std::fs;
 use std::mem::size_of;
-use std::ptr::{null, null_mut};
+use dlopen2::symbor::Library;
 use elfloader::arch::{x86, x86_64, arm, aarch64};
-use libc::{c_char, dlopen, RTLD_LAZY};
-use xmas_elf::program::Type;
+use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, size_t};
+use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
 use crate::android_library::{AndroidLibrary, Symbol};
@@ -15,12 +16,14 @@ use crate::page_utils::{page_end, page_start};
 type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
 pub struct AndroidLoader {
-    symbol_loader: SymbolLoader
+    symbol_loader: SymbolLoader,
+    libc: Library
 }
 
 #[derive(Debug)]
 pub enum AndroidLoaderErr {
     ElfError(ElfLoaderErr),
+    LibcLoadError(dlopen2::Error),
     FileError(std::io::Error)
 }
 
@@ -36,19 +39,18 @@ impl From<std::io::Error> for AndroidLoaderErr {
     }
 }
 
-static mut LIBC: *mut c_void = null_mut();
+impl From<dlopen2::Error> for AndroidLoaderErr {
+    fn from(err: dlopen2::Error) -> Self {
+        AndroidLoaderErr::LibcLoadError(err)
+    }
+}
 
 impl AndroidLoader {
-    pub fn new(symbol_loader: SymbolLoader) -> AndroidLoader {
-        unsafe {
-            if LIBC.is_null() {
-                LIBC = dlopen(null(), RTLD_LAZY);
-            }
-        }
-
-        AndroidLoader {
-            symbol_loader
-        }
+    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader, AndroidLoaderErr> {
+        Ok(AndroidLoader {
+            symbol_loader,
+            libc: Library::open_self()?
+        })
     }
 
     extern "C" fn no_pthread() -> i32 {
@@ -66,30 +68,18 @@ impl AndroidLoader {
                 return Some(std::mem::transmute(AndroidLoader::no_pthread as *mut ()));
             }
 
-            match CString::new(symbol_name) {
-                Ok(sym_name_c) => {
-                    let symbol = libc::dlsym(LIBC, sym_name_c.as_bytes_with_nul().as_ptr() as *const c_char);
-
-                    if symbol.is_null() {
-                        None
-                    } else {
-                        Some(std::mem::transmute(symbol))
-                    }
-                }
-                _ => None
+            match self.libc.symbol(symbol_name) {
+                Ok(sym) => Some(*sym),
+                Err(_) => None
             }
         }
     }
 
-    pub fn load_library(&mut self, path: &str) -> Result<AndroidLibrary, AndroidLoaderErr> {
+    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary, AndroidLoaderErr> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
-        let android_lib_mut = bin.load(self)?;
 
-        Ok(AndroidLibrary {
-            memory_map: android_lib_mut.memory_map.make_exec()?,
-            symbols: android_lib_mut.symbols
-        })
+        Ok(bin.load(self)?)
     }
 }
 
@@ -97,15 +87,10 @@ extern "C" fn undefined_symbol_handler() {
     panic!("Undefined function called.");
 }
 
-struct AndroidLibraryMut {
-    memory_map: MmapMut,
-    symbols: Vec<Symbol>
-}
-
 impl AndroidLoader {
     const WORD_SIZE: usize = size_of::<usize>();
 
-    fn absolute_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: usize) {
+    fn absolute_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
         let offset = entry.offset as usize;
 
         let symbol = match self.symbol_finder(library.symbols[entry.index as usize].name.as_str()) {
@@ -119,7 +104,7 @@ impl AndroidLoader {
         // unsafe { *((library.memory_map.as_mut_ptr() as u64 + offset as u64) as *mut usize) = num; }
     }
 
-    fn relative_reloc(&self, library: &mut AndroidLibraryMut, entry: RelocationEntry, addend: usize) {
+    fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
         let offset = entry.offset as usize;
         let map = &mut library.memory_map;
 
@@ -129,16 +114,16 @@ impl AndroidLoader {
     }
 }
 
-impl ElfLoader<AndroidLibraryMut> for AndroidLoader {
-    fn allocate(&mut self, load_headers: LoadableHeaders, elf_binary: &ElfBinary) -> Result<AndroidLibraryMut, ElfLoaderErr> {
-        let mut minimum = u64::MAX;
-        let mut maximum = u64::MIN;
+impl ElfLoader<AndroidLibrary> for AndroidLoader {
+    fn allocate(&self, load_headers: LoadableHeaders, elf_binary: &ElfBinary) -> Result<AndroidLibrary, ElfLoaderErr> {
+        let mut minimum = usize::MAX;
+        let mut maximum = usize::MIN;
 
         for header in load_headers {
             match header.get_type() {
                 Ok(Type::Load) => {
-                    let start = header.virtual_addr();
-                    let end = header.virtual_addr() + header.file_size();
+                    let start = page_start(header.virtual_addr() as usize);
+                    let end = page_end(start + max(header.file_size(), header.mem_size()) as usize);
 
                     if start < minimum {
                         minimum = start;
@@ -176,7 +161,7 @@ impl ElfLoader<AndroidLibraryMut> for AndroidLoader {
         if let Ok(map) = MmapOptions::new()
             .len(alloc_end - alloc_start)
             .map_anon() {
-            Ok(AndroidLibraryMut {
+            Ok(AndroidLibrary {
                 memory_map: map,
                 symbols
             })
@@ -187,12 +172,53 @@ impl ElfLoader<AndroidLibraryMut> for AndroidLoader {
         }
     }
 
-    fn load(&mut self, library: &mut AndroidLibraryMut, _: Flags, offset: VAddr, region: &[u8]) -> Result<(), ElfLoaderErr> {
-        library.memory_map[offset as usize..offset as usize + region.len()].copy_from_slice(region);
+    fn load(&self, library: &mut AndroidLibrary, program_header: &ProgramHeader, region: &[u8]) -> Result<(), ElfLoaderErr> {
+        let offset = program_header.offset() as usize;
+        let mem_size = program_header.mem_size() as usize;
+        // let program::Ph64(header) = program_header;
+        let addr = library.memory_map.as_ptr() as usize;
+        println!("{:x} - {:x} ({})", page_start(addr + offset), page_end(addr + offset + mem_size), offset + mem_size);
+        library.memory_map[offset..offset + region.len()].copy_from_slice(region);
+
+
+        /*
+        unsafe {
+            let start = page_start(addr + offset);
+            let mapped = libc::mmap(
+                start as *mut c_void,
+                (page_end(addr + offset + mem_size) - start) as libc::size_t,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                MAP_FIXED|MAP_PRIVATE|MAP_ANON,
+                -1,
+                0
+            );
+            // if mapped == MAP_FAILED {
+            //     return Result::Err(ElfLoaderErr::ElfParser {
+            //         source: "AAAAAAAAAAAAAa"
+            //     });
+            // }
+
+        }
+        // */
+
+        let flags = program_header.flags();
+        let mut prot = 0;
+        if flags.is_read() {
+            prot |= PROT_READ;
+        }
+        if flags.is_execute() {
+            prot |= PROT_EXEC;
+        }
+        if flags.is_write() {
+            prot |= PROT_WRITE;
+        }
+
+        let addr = library.memory_map.as_ptr() as usize;
+        unsafe { libc::mprotect(page_start(addr + offset as usize) as *mut c_void, (page_end(addr + region.len()) - addr) as size_t, prot) };
         Ok(())
     }
 
-    fn relocate(&mut self, library: &mut AndroidLibraryMut, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
+    fn relocate(&self, library: &mut AndroidLibrary, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
         match entry.rtype {
             RelocationType::x86(relocation) => {
                 match relocation {

@@ -7,8 +7,10 @@ edition = "2021"
 
 [dependencies]
 bytemuck = "1.12.3"
+dlopen2 = "0.4"
 elfloader = { path = "./rust-elfloader" }
 libc = "0.2.79"
 memmap2 = "0.5.8"
+once_cell = "1.16.0"
 page_size = "0.4.2"
 xmas-elf = "0.8"

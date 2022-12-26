@@ -1,4 +1,4 @@
-use memmap2::Mmap;
+use memmap2::MmapMut;
 
 pub(crate) struct Symbol {
     pub(crate) name: String,
@@ -6,7 +6,7 @@ pub(crate) struct Symbol {
 }
 
 pub struct AndroidLibrary {
-    pub(crate) memory_map: Mmap,
+    pub(crate) memory_map: MmapMut,
     pub(crate) symbols: Vec<Symbol>
 }
 
