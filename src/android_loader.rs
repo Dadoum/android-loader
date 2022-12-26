@@ -1,5 +1,6 @@
 use crate::android_library::{AndroidLibrary, Symbol};
 use crate::page_utils::{page_end, page_start};
+use anyhow::Result;
 use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
 use elfloader::{
@@ -10,11 +11,9 @@ use memmap2::MmapOptions;
 use std::cmp::max;
 use std::ffi::c_void;
 use std::fs;
-use std::mem::size_of;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
-use anyhow::Result;
 
 type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
@@ -32,24 +31,27 @@ impl AndroidLoader {
         })
     }
 
-    extern "C" fn no_pthread() -> i32 {
+    extern "C" fn pthread_stub() -> i32 {
         0
     }
 
-    fn symbol_finder(&self, symbol_name: &str) -> Option<extern "C" fn()> {
+    extern "C" fn undefined_symbol_stub() {
+        panic!("tried to call an undefined symbol");
+    }
+
+    fn symbol_finder(&self, symbol_name: &str) -> *const () {
+        // First choice: another function in the ELF
         if let Some(val) = (self.symbol_loader)(symbol_name) {
-            return Some(val);
-        }
-
-        unsafe {
-            if symbol_name.starts_with("pthread_") {
-                return Some(std::mem::transmute(AndroidLoader::no_pthread as *mut ()));
-            }
-
-            match self.libc.symbol(symbol_name) {
-                Ok(sym) => Some(*sym),
-                Err(_) => None,
-            }
+            val as *const ()
+        // Stub out pthread functions, don't need them
+        } else if symbol_name.starts_with("pthread_") {
+            Self::pthread_stub as *const ()
+        // Look it up in libc
+        } else if let Ok(sym) = unsafe { self.libc.symbol(symbol_name) } {
+            *sym
+        // Couldn't find a symbol :(
+        } else {
+            Self::undefined_symbol_stub as *const ()
         }
     }
 
@@ -61,15 +63,9 @@ impl AndroidLoader {
     }
 }
 
-extern "C" fn undefined_symbol_handler() {
-    panic!("Undefined function called.");
-}
-
 impl AndroidLoader {
     fn absolute_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let symbol = self
-            .symbol_finder(&library.symbols[entry.index as usize].name)
-            .unwrap_or(undefined_symbol_handler);
+        let symbol = self.symbol_finder(&library.symbols[entry.index as usize].name);
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
@@ -79,7 +75,7 @@ impl AndroidLoader {
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
-    fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {        
+    fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
         let relocated = (library.memory_map.as_mut_ptr() as usize + addend).to_ne_bytes();
 
         let offset = entry.offset as usize;
