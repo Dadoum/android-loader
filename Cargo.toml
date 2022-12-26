@@ -12,3 +12,4 @@ elfloader = { path = "./rust-elfloader" }
 memmap2 = "0.5.8"
 once_cell = "1.16.0"
 xmas-elf = "0.8"
+anyhow = "1.0"

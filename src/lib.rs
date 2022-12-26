@@ -46,7 +46,7 @@ mod tests {
         let store_services_core = LOADER.load_library("lib/x86_64/libstoreservicescore.so").expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");
-        let set_android_identifier: extern "C" fn(*const c_char, u32) -> i32 = unsafe { std::mem::transmute(store_services_core.get_symbol("Sph98paBcz")) }; // Sph98paBcz abort
+        let set_android_identifier: extern "C" fn(*const c_char, u32) -> i32 = unsafe { std::mem::transmute(store_services_core.get_symbol("Sph98paBcz").unwrap()) }; // Sph98paBcz abort
         // println!("{:p}", set_android_identifier as *const ());
         let identifier = "f213456789abcde0";
         let str = CString::new(identifier).unwrap();

@@ -1,79 +1,59 @@
+use crate::android_library::{AndroidLibrary, Symbol};
+use anyhow::Result;
+use dlopen2::symbor::Library;
+use elfloader::arch::{aarch64, arm, x86, x86_64};
+use elfloader::{
+    ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType,
+};
+use memmap2::MmapOptions;
+use region::Protection;
 use std::cmp::max;
 use std::ffi::c_void;
-use elfloader::{ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType};
-use memmap2::MmapOptions;
 use std::fs;
-use std::mem::size_of;
-use dlopen2::symbor::Library;
-use elfloader::arch::{x86, x86_64, arm, aarch64};
-use region::Protection;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
-use crate::android_library::{AndroidLibrary, Symbol};
 
 type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
 pub struct AndroidLoader {
     symbol_loader: SymbolLoader,
-    libc: Library
-}
-
-#[derive(Debug)]
-pub enum AndroidLoaderErr {
-    ElfError(ElfLoaderErr),
-    LibcLoadError(dlopen2::Error),
-    FileError(std::io::Error)
-}
-
-impl From<ElfLoaderErr> for AndroidLoaderErr {
-    fn from(err: ElfLoaderErr) -> Self {
-        AndroidLoaderErr::ElfError(err)
-    }
-}
-
-impl From<std::io::Error> for AndroidLoaderErr {
-    fn from(err: std::io::Error) -> Self {
-        AndroidLoaderErr::FileError(err)
-    }
-}
-
-impl From<dlopen2::Error> for AndroidLoaderErr {
-    fn from(err: dlopen2::Error) -> Self {
-        AndroidLoaderErr::LibcLoadError(err)
-    }
+    libc: Library,
 }
 
 impl AndroidLoader {
-    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader, AndroidLoaderErr> {
+    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader> {
         Ok(AndroidLoader {
             symbol_loader,
-            libc: Library::open_self()?
+            libc: Library::open_self()?,
         })
     }
 
-    extern "C" fn no_pthread() -> i32 {
+    extern "C" fn pthread_stub() -> i32 {
         0
     }
 
-    fn symbol_finder(&self, symbol_name: &str) -> Option<extern "C" fn()> {
+    extern "C" fn undefined_symbol_stub() {
+        panic!("tried to call an undefined symbol");
+    }
+
+    fn symbol_finder(&self, symbol_name: &str) -> *const () {
+        // First choice: another function in the ELF
         if let Some(val) = (self.symbol_loader)(symbol_name) {
-            return Some(val);
-        }
-
-        unsafe {
-            if symbol_name.starts_with("pthread_") {
-                return Some(std::mem::transmute(AndroidLoader::no_pthread as *mut ()));
-            }
-
-            match self.libc.symbol(symbol_name) {
-                Ok(sym) => Some(*sym),
-                Err(_) => None
-            }
+            val as *const ()
+        // Stub out pthread functions, don't need them
+        } else if symbol_name.starts_with("pthread_") {
+            Self::pthread_stub as *const ()
+        // Look it up in libc
+        } else if let Ok(sym) = unsafe { self.libc.symbol(symbol_name) } {
+            *sym
+        // Couldn't find a symbol :(
+        } else {
+            Self::undefined_symbol_stub as *const ()
         }
     }
 
-    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary, AndroidLoaderErr> {
+    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
@@ -81,60 +61,32 @@ impl AndroidLoader {
     }
 }
 
-extern "C" fn undefined_symbol_handler() {
-    panic!("Undefined function called.");
-}
-
 impl AndroidLoader {
-    const WORD_SIZE: usize = size_of::<usize>();
-
-    #[cfg(target_pointer_width = "64")]
     fn absolute_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+        let symbol = self.symbol_finder(&library.symbols[entry.index as usize].name);
+
+        // addend is always 0, but we still add it to be safe
+        // converted to an array in the systme endianess
+        let relocated = (symbol as usize + addend).to_ne_bytes();
+
         let offset = entry.offset as usize;
-        let map = &mut library.memory_map;
-
-        let symbol = self.symbol_finder(library.symbols[entry.index as usize].name.as_str()).unwrap_or(undefined_symbol_handler);
-
-        let num = symbol as usize + addend;
-        let data: [u8; AndroidLoader::WORD_SIZE] = num.to_ne_bytes();
-        map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
+        library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
-    #[cfg(target_pointer_width = "64")]
     fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+        let relocated = (library.memory_map.as_mut_ptr() as usize + addend).to_ne_bytes();
+
         let offset = entry.offset as usize;
-        let map = &mut library.memory_map;
-
-        let num = addend + map.as_ptr() as usize;
-        let data: [u8; AndroidLoader::WORD_SIZE] = num.to_ne_bytes();
-        map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
-    }
-
-    #[cfg(target_pointer_width = "32")]
-    fn absolute_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let offset = entry.offset as usize;
-        let map = &mut library.memory_map;
-
-        let symbol = self.symbol_finder(library.symbols[entry.index as usize].name.as_str()).unwrap_or(undefined_symbol_handler);
-
-        let num = symbol as usize + addend;
-        let data: [u8; AndroidLoader::WORD_SIZE] = num.to_ne_bytes();
-        map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
-    }
-
-    #[cfg(target_pointer_width = "32")]
-    fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let offset = entry.offset as usize;
-        let map = &mut library.memory_map;
-
-        let num = addend.wrapping_add(map.as_ptr() as usize);
-        let data: [u8; AndroidLoader::WORD_SIZE] = num.to_ne_bytes();
-        map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
+        library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 }
 
 impl ElfLoader<AndroidLibrary> for AndroidLoader {
-    fn allocate(&self, load_headers: LoadableHeaders, elf_binary: &ElfBinary) -> Result<AndroidLibrary, ElfLoaderErr> {
+    fn allocate(
+        &self,
+        load_headers: LoadableHeaders,
+        elf_binary: &ElfBinary,
+    ) -> Result<AndroidLibrary, ElfLoaderErr> {
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
 
@@ -161,34 +113,41 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         let dyn_symbol_section = elf_binary.file.find_section_by_name(".dynsym").unwrap();
         let dyn_symbol_table = dyn_symbol_section.get_data(&elf_binary.file).unwrap();
         let symbols = match dyn_symbol_table {
-            SectionData::DynSymbolTable64(entries)
-            => entries.iter().map(|s| Symbol {
-                name: elf_binary.symbol_name(s).to_string(),
-                value: s.value() as usize
-            }).collect(),
-            SectionData::DynSymbolTable32(entries)
-            => entries.iter().map(|s| Symbol {
-                name: elf_binary.symbol_name(s).to_string(),
-                value: s.value() as usize
-            }).collect(),
-            _ => Vec::new()
+            SectionData::DynSymbolTable64(entries) => entries
+                .iter()
+                .map(|s| Symbol {
+                    name: elf_binary.symbol_name(s).to_string(),
+                    value: s.value() as usize,
+                })
+                .collect(),
+            SectionData::DynSymbolTable32(entries) => entries
+                .iter()
+                .map(|s| Symbol {
+                    name: elf_binary.symbol_name(s).to_string(),
+                    value: s.value() as usize,
+                })
+                .collect(),
+            _ => Vec::new(),
         };
 
-        if let Ok(map) = MmapOptions::new()
-            .len(alloc_end - alloc_start)
-            .map_anon() {
+        if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
             Ok(AndroidLibrary {
                 memory_map: map,
-                symbols
+                symbols,
             })
         } else {
             Err(ElfLoaderErr::ElfParser {
-                source: "Memory mapping failed!"
+                source: "Memory mapping failed!",
             })
         }
     }
 
-    fn load(&self, library: &mut AndroidLibrary, program_header: &ProgramHeader, region: &[u8]) -> Result<(), ElfLoaderErr> {
+    fn load(
+        &self,
+        library: &mut AndroidLibrary,
+        program_header: &ProgramHeader,
+        region: &[u8],
+    ) -> Result<(), ElfLoaderErr> {
         // let offset = program_header.offset() as usize;
         let virtual_addr = program_header.virtual_addr() as usize;
         let mem_size = program_header.mem_size() as usize;
@@ -221,106 +180,84 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         }
         library.memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(region);
 
-        if file_size < mem_size {
-
-        }
-
         unsafe { region::protect(start_addr, end_addr as usize - start_addr as usize, Protection::from_bits_truncate(prot)).unwrap() };
+
         Ok(())
     }
 
-    fn relocate(&self, library: &mut AndroidLibrary, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
+    fn relocate(
+        &self,
+        library: &mut AndroidLibrary,
+        entry: RelocationEntry,
+    ) -> Result<(), ElfLoaderErr> {
         match entry.rtype {
-            RelocationType::x86(relocation) => {
-                let addend = unsafe { *((library.memory_map.as_ptr() as usize + entry.offset as usize) as *mut usize) };
+            RelocationType::x86(relocation) => match relocation {
+                x86::RelocationTypes::R_386_GLOB_DAT
+                | x86::RelocationTypes::R_386_JMP_SLOT
+                | x86::RelocationTypes::R_386_32 => Err(ElfLoaderErr::UnsupportedRelocationEntry),
 
-                match relocation {
-                    x86::RelocationTypes::R_386_GLOB_DAT |
-                    x86::RelocationTypes::R_386_JMP_SLOT => {
-                        self.absolute_reloc(library, entry, addend);
-                        Ok(())
-                    },
-
-                    x86::RelocationTypes::R_386_RELATIVE => {
-                        println!("addend {}", addend);
-                        self.relative_reloc(library, entry, addend);
-                        Ok(())
-                    },
-
-                    x86::RelocationTypes::R_386_PC32 => {
-                        let offset = entry.offset as usize;
-                        let map = &mut library.memory_map;
-
-                        let symbol = self.symbol_finder(library.symbols[entry.index as usize].name.as_str()).unwrap_or(undefined_symbol_handler);
-
-                        // let num = symbol as usize - map.as_ptr();
-                        // let data: [u8; AndroidLoader::WORD_SIZE] = num.to_ne_bytes();
-                        // map[offset..offset + AndroidLoader::WORD_SIZE].copy_from_slice(&data);
-
-                        Ok(())
-                    },
-
-                    entry => {
-                        println!("{:?}", entry);
-                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
-                    }
+                x86::RelocationTypes::R_386_RELATIVE => {
+                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
                 }
-            }
+
+                _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+            },
 
             RelocationType::x86_64(relocation) => {
-                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)? as usize;
+                let addend = entry
+                    .addend
+                    .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
+                    as usize;
                 match relocation {
-                    x86_64::RelocationTypes::R_AMD64_JMP_SLOT |
-                    x86_64::RelocationTypes::R_AMD64_GLOB_DAT |
-                    x86_64::RelocationTypes::R_AMD64_64 => {
+                    x86_64::RelocationTypes::R_AMD64_JMP_SLOT
+                    | x86_64::RelocationTypes::R_AMD64_GLOB_DAT
+                    | x86_64::RelocationTypes::R_AMD64_64 => {
                         self.absolute_reloc(library, entry, addend);
                         Ok(())
-                    },
+                    }
 
                     x86_64::RelocationTypes::R_AMD64_RELATIVE => {
                         self.relative_reloc(library, entry, addend);
                         Ok(())
-                    },
+                    }
 
-                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
                 }
             }
 
-            RelocationType::Arm(relocation) => {
-                let addend = unsafe { *((library.memory_map.as_ptr() as usize + entry.offset as usize) as *mut usize) };
-                match relocation {
-                    arm::RelocationTypes::R_ARM_JUMP_SLOT |
-                    arm::RelocationTypes::R_ARM_GLOB_DAT  |
-                    arm::RelocationTypes::R_ARM_ABS32 => {
-                        self.absolute_reloc(library, entry, addend);
-                        Ok(())
-                    },
-
-                    arm::RelocationTypes::R_ARM_RELATIVE => {
-                        self.relative_reloc(library, entry, addend);
-                        Ok(())
-                    },
-
-                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry)
+            RelocationType::Arm(relocation) => match relocation {
+                arm::RelocationTypes::R_ARM_JUMP_SLOT
+                | arm::RelocationTypes::R_ARM_GLOB_DAT
+                | arm::RelocationTypes::R_ARM_ABS32 => {
+                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
                 }
-            }
+
+                arm::RelocationTypes::R_ARM_RELATIVE => {
+                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                }
+
+                _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+            },
 
             RelocationType::AArch64(relocation) => {
-                let addend = entry.addend.ok_or(ElfLoaderErr::UnsupportedRelocationEntry)? as usize;
+                let addend = entry
+                    .addend
+                    .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
+                    as usize;
                 match relocation {
-                    aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT |
-                    aarch64::RelocationTypes::R_AARCH64_GLOB_DAT  |
-                    aarch64::RelocationTypes::R_AARCH64_ABS64 => {
+                    aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT
+                    | aarch64::RelocationTypes::R_AARCH64_GLOB_DAT
+                    | aarch64::RelocationTypes::R_AARCH64_ABS64 => {
                         self.absolute_reloc(library, entry, addend);
                         Ok(())
-                    },
+                    }
 
                     aarch64::RelocationTypes::R_AARCH64_RELATIVE => {
                         self.relative_reloc(library, entry, addend);
                         Ok(())
-                    },
+                    }
 
-                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
                 }
             }
         }
