@@ -14,6 +14,7 @@ use std::mem::size_of;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
+use anyhow::Result;
 
 type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
@@ -22,33 +23,8 @@ pub struct AndroidLoader {
     libc: Library,
 }
 
-#[derive(Debug)]
-pub enum AndroidLoaderErr {
-    ElfError(ElfLoaderErr),
-    LibcLoadError(dlopen2::Error),
-    FileError(std::io::Error),
-}
-
-impl From<ElfLoaderErr> for AndroidLoaderErr {
-    fn from(err: ElfLoaderErr) -> Self {
-        AndroidLoaderErr::ElfError(err)
-    }
-}
-
-impl From<std::io::Error> for AndroidLoaderErr {
-    fn from(err: std::io::Error) -> Self {
-        AndroidLoaderErr::FileError(err)
-    }
-}
-
-impl From<dlopen2::Error> for AndroidLoaderErr {
-    fn from(err: dlopen2::Error) -> Self {
-        AndroidLoaderErr::LibcLoadError(err)
-    }
-}
-
 impl AndroidLoader {
-    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader, AndroidLoaderErr> {
+    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader> {
         eprintln!("Page size: {}", page_size::get());
         Ok(AndroidLoader {
             symbol_loader,
@@ -77,7 +53,7 @@ impl AndroidLoader {
         }
     }
 
-    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary, AndroidLoaderErr> {
+    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
