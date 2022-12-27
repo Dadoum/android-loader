@@ -11,7 +11,8 @@ pub(crate) struct Symbol {
 pub struct AndroidLibrary {
     pub(crate) memory_map: MmapMut,
     pub(crate) symbols: Vec<Symbol>,
-    pub(crate) libc: Library
+    pub(crate) libc: Library,
+    // IMPORTANT: Updating this will NOT change the hooks in use, they MUST be specified during load
     pub(crate) hooks: HashMap<String, usize>,
 }
 

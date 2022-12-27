@@ -38,6 +38,11 @@ pub fn add_hook(range: Range<usize>, name: &str, ptr: usize) {
     hook_list.insert(name.to_owned(), ptr);
 }
 
+pub fn set_hooks(range: Range<usize>, hooks: HashMap<String, usize>) {
+    let mut hook_list = HOOKS.lock().unwrap();
+    hook_list.insert(range, hooks);
+}
+
 #[inline(always)]
 #[cfg(target_arch = "aarch64")]
 /// Get the caller of the current function

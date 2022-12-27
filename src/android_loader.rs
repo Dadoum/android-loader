@@ -1,4 +1,5 @@
 use crate::android_library::{AndroidLibrary, Symbol};
+use crate::hook_manager::{self, get_caller, get_range};
 use anyhow::Result;
 use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
@@ -7,10 +8,13 @@ use elfloader::{
 };
 use memmap2::MmapOptions;
 use region::Protection;
+use std::arch::asm;
 use std::cmp::max;
+use std::collections::HashMap;
 use std::os::raw::{c_char, c_void};
 use std::ffi::CStr;
 use std::fs;
+use std::panic::Location;
 use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
@@ -30,9 +34,11 @@ impl AndroidLoader {
     }
 
     unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        let parent_hooks = hook_manager::get_hooks(get_range(get_caller()).unwrap()).unwrap();
+        println!("Caller: {:p}", get_caller() as *const ());
         let name = CStr::from_ptr(name).to_str().unwrap();
         println!("Library requested: {}", name);
-        match Self::load_library(name) {
+        match Self::load_library_with_hooks(name, parent_hooks) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
             Err(_) => null_mut()
         }
@@ -56,9 +62,9 @@ impl AndroidLoader {
     }
 
     fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
-        // First we check if the library wants specific symbols
-        if let Some(func) = (library.symbol_loader)(symbol_name) {
-            func as *const ()
+        // Check if this function is hooked for this library
+        if let Some(func) = library.hooks.get(symbol_name) {
+            *func as *const ()
         // pthread functions are problematic, let's ignore them
         } else if symbol_name.starts_with("pthread_") {
             Self::pthread_stub as *const ()
@@ -80,10 +86,14 @@ impl AndroidLoader {
     }
 
     pub fn load_library(path: &str) -> Result<AndroidLibrary> {
+        Self::load_library_with_hooks(path, HashMap::new())
+    }
+
+    pub fn load_library_with_hooks(path: &str, hooks: HashMap<String, usize>) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
-        Ok(bin.load::<Self, AndroidLibrary>()?)
+        Ok(bin.load::<Self, AndroidLibrary>(hooks)?)
     }
 }
 
@@ -111,6 +121,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
     fn allocate(
         load_headers: LoadableHeaders,
         elf_binary: &ElfBinary,
+        hooks: HashMap<String, usize>,
     ) -> Result<AndroidLibrary, ElfLoaderErr> {
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
@@ -156,10 +167,11 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         };
 
         if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
+            hook_manager::set_hooks(map.as_ptr_range().start as usize..map.as_ptr_range().end as usize, hooks.clone());
             Ok(AndroidLibrary {
                 memory_map: map,
                 symbols,
-                symbol_loader: |_| None,
+                hooks,
                 libc: Library::open_self().unwrap(),
             })
         } else {
