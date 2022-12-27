@@ -46,6 +46,7 @@ impl AndroidLoader {
         }
     }
 
+    #[cfg(not(feature = "hacky_hooks"))]
     unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::get_hooks;
 
