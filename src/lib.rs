@@ -5,7 +5,8 @@ pub mod android_loader;
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{c_char, CString};
+    use std::os::raw::c_char;
+    use std::ffi::CString;
     use crate::android_loader::AndroidLoader;
 
     #[test]

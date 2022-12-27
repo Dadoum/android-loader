@@ -8,7 +8,8 @@ use elfloader::{
 use memmap2::MmapOptions;
 use region::Protection;
 use std::cmp::max;
-use std::ffi::{c_char, c_void, CStr};
+use std::os::raw::{c_char, c_void};
+use std::ffi::CStr;
 use std::fs;
 use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
