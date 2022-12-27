@@ -1,6 +1,28 @@
 use lazy_static::lazy_static;
 use std::{arch::asm, collections::HashMap, ops::Range, sync::Mutex};
 
+#[cfg(not(feature = "hacky_hooks"))]
+lazy_static! {
+    static ref HOOKS: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+}
+
+#[cfg(not(feature = "hacky_hooks"))]
+/// Get the list of hooks
+pub fn get_hooks() -> HashMap<String, usize> {
+    let hooks = HOOKS.lock().unwrap();
+    hooks.clone()
+}
+
+#[cfg(not(feature = "hacky_hooks"))]
+/// Add a list of hooks to the global list
+pub fn add_hooks(hooks: HashMap<String, usize>) {
+    let mut global_hooks = HOOKS.lock().unwrap();
+    for (key, value) in hooks.iter() {
+        global_hooks.insert(key.clone(), *value);
+    }
+}
+
+#[cfg(feature = "hacky_hooks")]
 lazy_static! {
     // Create a Mutex, surrounding a HashMap of Range<usize> -> HashMap<String, usize>
     // The Range<usize> is the range of memory that the library is mapped to
@@ -9,6 +31,7 @@ lazy_static! {
         Mutex::new(HashMap::new());
 }
 
+#[cfg(feature = "hacky_hooks")]
 /// Get the range containing the given point, or None if no range contains it
 pub fn get_range(point: usize) -> Option<Range<usize>> {
     let mut range = None;
@@ -25,12 +48,14 @@ pub fn get_range(point: usize) -> Option<Range<usize>> {
     range
 }
 
+#[cfg(feature = "hacky_hooks")]
 /// Get the list of hooks for the given range, or None if no such range exists
 pub fn get_hooks(range: Range<usize>) -> Option<HashMap<String, usize>> {
     let hooks = HOOKS.lock().unwrap();
     hooks.get(&range).cloned()
 }
 
+#[cfg(feature = "hacky_hooks")]
 /// Set the list of hooks for the given range
 pub fn set_hooks(range: Range<usize>, hooks: HashMap<String, usize>) {
     let mut hook_list = HOOKS.lock().unwrap();

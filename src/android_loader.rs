@@ -1,5 +1,5 @@
 use crate::android_library::{AndroidLibrary, Symbol};
-use crate::hook_manager::{self, get_caller, get_range};
+use crate::hook_manager;
 use anyhow::Result;
 use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
@@ -29,15 +29,31 @@ impl AndroidLoader {
         panic!("tried to call an undefined symbol");
     }
 
+    #[cfg(feature = "hacky_hooks")]
     unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        use crate::hook_manager::{get_caller, get_hooks, get_range};
+
         let caller = get_caller();
         println!("Caller: {:p}", caller as *const ());
-        let parent_hooks = hook_manager::get_hooks(get_range(caller).unwrap()).unwrap();
+        let parent_hooks = get_hooks(get_range(caller).unwrap()).unwrap();
         println!("Parent hooks: {:?}", parent_hooks);
         //println!("Caller: {:p}", get_caller() as *const ());
         let name = CStr::from_ptr(name).to_str().unwrap();
         println!("Library requested: {}", name);
         match Self::load_library_with_hooks(name, parent_hooks) {
+            Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
+            Err(_) => null_mut(),
+        }
+    }
+
+    unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        use crate::hook_manager::get_hooks;
+
+        let hooks = get_hooks();
+        println!("Hooks: {:?}", hooks);
+        let name = CStr::from_ptr(name).to_str().unwrap();
+        println!("Library requested: {}", name);
+        match Self::load_library_with_hooks(name, hooks) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
             Err(_) => null_mut(),
         }
@@ -56,9 +72,36 @@ impl AndroidLoader {
         let _ = Box::from_raw(library);
     }
 
+    #[cfg(feature = "hacky_hooks")]
     fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
         // Check if this function is hooked for this library
         if let Some(func) = library.hooks.get(symbol_name) {
+            *func as *const ()
+        // pthread functions are problematic, let's ignore them
+        } else if symbol_name.starts_with("pthread_") {
+            Self::pthread_stub as *const ()
+        } else if symbol_name == "dlopen" {
+            // TODO find a better way to do this
+            Self::dlopen as *const ()
+        } else if symbol_name == "dlsym" {
+            Self::dlsym as *const ()
+        } else if symbol_name == "dlclose" {
+            Self::dlclose as *const ()
+        // Look it up in libc
+        } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
+            *sym
+        // Couldn't find a symbol :(
+        } else {
+            Self::undefined_symbol_stub as *const ()
+        }
+    }
+
+    #[cfg(not(feature = "hacky_hooks"))]
+    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
+        // Check if this function is hooked for this library
+        use crate::hook_manager::get_hooks;
+
+        if let Some(func) = get_hooks().get(symbol_name) {
             *func as *const ()
         // pthread functions are problematic, let's ignore them
         } else if symbol_name.starts_with("pthread_") {
@@ -169,16 +212,28 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         };
 
         if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
-            hook_manager::set_hooks(
-                map.as_ptr_range().start as usize..map.as_ptr_range().end as usize,
-                hooks.clone(),
-            );
-            Ok(AndroidLibrary {
-                memory_map: map,
-                symbols,
-                hooks,
-                libc: Library::open_self().unwrap(),
-            })
+            #[cfg(feature = "hacky_hooks")]
+            {
+                hook_manager::set_hooks(
+                    map.as_ptr_range().start as usize..map.as_ptr_range().end as usize,
+                    hooks.clone(),
+                );
+                Ok(AndroidLibrary {
+                    memory_map: map,
+                    symbols,
+                    hooks,
+                    libc: Library::open_self().unwrap(),
+                })
+            }
+            #[cfg(not(feature = "hacky_hooks"))]
+            {
+                hook_manager::add_hooks(hooks);
+                Ok(AndroidLibrary {
+                    memory_map: map,
+                    symbols,
+                    libc: Library::open_self().unwrap(),
+                })
+            }
         } else {
             Err(ElfLoaderErr::ElfParser {
                 source: "Memory mapping failed!",
