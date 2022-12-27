@@ -50,8 +50,11 @@ impl AndroidLoader {
     }
 
     fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
+        // First we check if the library wants specific symbols
+        if let Some(func) = (library.symbol_loader)(symbol_name) {
+            func as *const ()
         // pthread functions are problematic, let's ignore them
-        if symbol_name.starts_with("pthread_") {
+        } else if symbol_name.starts_with("pthread_") {
             Self::pthread_stub as *const ()
         } else if symbol_name == "dlopen" { // TODO find a better way to do this
             Self::dlopen as *const ()

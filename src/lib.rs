@@ -5,10 +5,7 @@ pub mod android_loader;
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{c_char, c_void, CStr, CString};
-    use std::ptr::null_mut;
-    use once_cell::sync::Lazy;
-    use crate::android_library::AndroidLibrary;
+    use std::ffi::{c_char, CString};
     use crate::android_loader::AndroidLoader;
 
     #[test]

@@ -10,7 +10,6 @@ dependencies = [
  "dlopen2",
  "elfloader",
  "memmap2",
- "once_cell",
  "region",
  "xmas-elf",
 ]
