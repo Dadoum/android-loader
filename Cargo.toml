@@ -14,3 +14,4 @@ elfloader = { git = "https://github.com/Dadoum/rust-elfloader" }
 memmap2 = "0.5.8"
 region = "3.0.0"
 xmas-elf = "0.8"
+rand = "0.8.4"

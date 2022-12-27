@@ -15,6 +15,7 @@ use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
+use rand::Rng;
 
 pub struct AndroidLoader {
 }
@@ -50,6 +51,10 @@ impl AndroidLoader {
         let _ = Box::from_raw(library);
     }
 
+    unsafe extern "C" fn arc4random() -> u32 {
+        rand::thread_rng().gen()
+    }
+
     fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
         // First we check if the library wants specific symbols
         if let Some(func) = (library.symbol_loader)(symbol_name) {
@@ -67,6 +72,8 @@ impl AndroidLoader {
         } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
             *sym
         // Couldn't find a symbol :(
+        } else if symbol_name == "arc4random" {
+            Self::arc4random as *const ()
         } else {
             Self::undefined_symbol_stub as *const ()
         }
