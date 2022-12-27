@@ -1,3 +1,4 @@
 /target
 /lib
 /vgcore.*
+Cargo.lock
