@@ -1,4 +1,4 @@
-use std::{ops::Range, collections::HashMap};
+use std::collections::HashMap;
 
 use dlopen2::symbor::Library;
 use memmap2::MmapMut;
