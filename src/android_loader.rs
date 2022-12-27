@@ -8,27 +8,17 @@ use elfloader::{
 use memmap2::MmapOptions;
 use region::Protection;
 use std::cmp::max;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::fs;
+use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
 
-type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
-
 pub struct AndroidLoader {
-    symbol_loader: SymbolLoader,
-    libc: Library,
 }
 
 impl AndroidLoader {
-    pub fn new(symbol_loader: SymbolLoader) -> Result<AndroidLoader> {
-        Ok(AndroidLoader {
-            symbol_loader,
-            libc: Library::open_self()?,
-        })
-    }
-
     extern "C" fn pthread_stub() -> i32 {
         0
     }
@@ -37,15 +27,40 @@ impl AndroidLoader {
         panic!("tried to call an undefined symbol");
     }
 
-    fn symbol_finder(&self, symbol_name: &str) -> *const () {
-        // First choice: another function in the ELF
-        if let Some(val) = (self.symbol_loader)(symbol_name) {
-            val as *const ()
-        // Stub out pthread functions, don't need them
-        } else if symbol_name.starts_with("pthread_") {
+    pub unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        let name = CStr::from_ptr(name).to_str().unwrap();
+        println!("Library requested: {}", name);
+        match Self::load_library(name) {
+            Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
+            Err(_) => null_mut()
+        }
+    }
+
+    pub unsafe extern "C" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
+        let symbol = CStr::from_ptr(symbol).to_str().unwrap();
+        println!("Symbol requested: {}", symbol);
+        match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
+            Some(func) => func as *mut c_void,
+            None => null_mut()
+        }
+    }
+
+    pub unsafe extern "C" fn dlclose(library: *mut AndroidLibrary) {
+        let _ = Box::from_raw(library);
+    }
+
+    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
+        // pthread functions are problematic, let's ignore them
+        if symbol_name.starts_with("pthread_") {
             Self::pthread_stub as *const ()
+        } else if symbol_name == "dlopen" { // TODO find a better way to do this
+            Self::dlopen as *const ()
+        } else if symbol_name == "dlsym" {
+            Self::dlsym as *const ()
+        } else if symbol_name == "dlclose" {
+            Self::dlclose as *const ()
         // Look it up in libc
-        } else if let Ok(sym) = unsafe { self.libc.symbol(symbol_name) } {
+        } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
             *sym
         // Couldn't find a symbol :(
         } else {
@@ -53,17 +68,17 @@ impl AndroidLoader {
         }
     }
 
-    pub fn load_library(&self, path: &str) -> Result<AndroidLibrary> {
+    pub fn load_library(path: &str) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
-        Ok(bin.load(self)?)
+        Ok(bin.load::<Self, AndroidLibrary>()?)
     }
 }
 
 impl AndroidLoader {
-    fn absolute_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let symbol = self.symbol_finder(&library.symbols[entry.index as usize].name);
+    fn absolute_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+        let symbol = Self::symbol_finder(&library.symbols[entry.index as usize].name, library);
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
@@ -73,7 +88,7 @@ impl AndroidLoader {
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
-    fn relative_reloc(&self, library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+    fn relative_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
         let relocated = (library.memory_map.as_mut_ptr() as usize + addend).to_ne_bytes();
 
         let offset = entry.offset as usize;
@@ -83,7 +98,6 @@ impl AndroidLoader {
 
 impl ElfLoader<AndroidLibrary> for AndroidLoader {
     fn allocate(
-        &self,
         load_headers: LoadableHeaders,
         elf_binary: &ElfBinary,
     ) -> Result<AndroidLibrary, ElfLoaderErr> {
@@ -134,6 +148,8 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             Ok(AndroidLibrary {
                 memory_map: map,
                 symbols,
+                symbol_loader: |_| None,
+                libc: Library::open_self().unwrap(),
             })
         } else {
             Err(ElfLoaderErr::ElfParser {
@@ -143,7 +159,6 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
     }
 
     fn load(
-        &self,
         library: &mut AndroidLibrary,
         program_header: &ProgramHeader,
         region: &[u8],
@@ -186,7 +201,6 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
     }
 
     fn relocate(
-        &self,
         library: &mut AndroidLibrary,
         entry: RelocationEntry,
     ) -> Result<(), ElfLoaderErr> {
@@ -212,12 +226,12 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                     x86_64::RelocationTypes::R_AMD64_JMP_SLOT
                     | x86_64::RelocationTypes::R_AMD64_GLOB_DAT
                     | x86_64::RelocationTypes::R_AMD64_64 => {
-                        self.absolute_reloc(library, entry, addend);
+                        Self::absolute_reloc(library, entry, addend);
                         Ok(())
                     }
 
                     x86_64::RelocationTypes::R_AMD64_RELATIVE => {
-                        self.relative_reloc(library, entry, addend);
+                        Self::relative_reloc(library, entry, addend);
                         Ok(())
                     }
 
@@ -248,12 +262,12 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                     aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT
                     | aarch64::RelocationTypes::R_AARCH64_GLOB_DAT
                     | aarch64::RelocationTypes::R_AARCH64_ABS64 => {
-                        self.absolute_reloc(library, entry, addend);
+                        Self::absolute_reloc(library, entry, addend);
                         Ok(())
                     }
 
                     aarch64::RelocationTypes::R_AARCH64_RELATIVE => {
-                        self.relative_reloc(library, entry, addend);
+                        Self::relative_reloc(library, entry, addend);
                         Ok(())
                     }
 

@@ -1,4 +1,7 @@
+use dlopen2::symbor::Library;
 use memmap2::MmapMut;
+
+type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
 pub(crate) struct Symbol {
     pub(crate) name: String,
@@ -8,6 +11,8 @@ pub(crate) struct Symbol {
 pub struct AndroidLibrary {
     pub(crate) memory_map: MmapMut,
     pub(crate) symbols: Vec<Symbol>,
+    pub(crate) symbol_loader: SymbolLoader,
+    pub(crate) libc: Library
 }
 
 impl AndroidLibrary {
