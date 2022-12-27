@@ -1,3 +1,0 @@
-[submodule "rust-elfloader"]
-	path = rust-elfloader
-	url = https://github.com/Dadoum/rust-elfloader

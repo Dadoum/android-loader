@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-region = "3.0.0"
-dlopen2 = "0.4"
-elfloader = { path = "./rust-elfloader" }
-memmap2 = "0.5.8"
-xmas-elf = "0.8"
 anyhow = "1.0"
+dlopen2 = "0.4"
+elfloader = { git = "https://github.com/Dadoum/rust-elfloader" }
+memmap2 = "0.5.8"
+region = "3.0.0"
+xmas-elf = "0.8"

@@ -58,6 +58,7 @@ dependencies = [
 [[package]]
 name = "elfloader"
 version = "0.16.0"
+source = "git+https://github.com/Dadoum/rust-elfloader#3b6f464402067c2c616df3e31b1e64d520d629e9"
 dependencies = [
  "bitflags",
  "log",
