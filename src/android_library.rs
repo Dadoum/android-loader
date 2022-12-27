@@ -1,7 +1,7 @@
+use std::{ops::Range, collections::HashMap};
+
 use dlopen2::symbor::Library;
 use memmap2::MmapMut;
-
-type SymbolLoader = fn(symbol_name: &str) -> Option<extern "C" fn()>;
 
 pub(crate) struct Symbol {
     pub(crate) name: String,
@@ -11,8 +11,8 @@ pub(crate) struct Symbol {
 pub struct AndroidLibrary {
     pub(crate) memory_map: MmapMut,
     pub(crate) symbols: Vec<Symbol>,
-    pub(crate) symbol_loader: SymbolLoader,
     pub(crate) libc: Library
+    pub(crate) hooks: HashMap<String, usize>,
 }
 
 impl AndroidLibrary {
@@ -22,5 +22,9 @@ impl AndroidLibrary {
             .iter()
             .find(|s| s.name == symbol_name)
             .map(|s| unsafe { self.memory_map.as_ptr().offset(s.value as isize) as *const () })
+    }
+
+    pub fn get_range(&self) -> Range<usize> {
+        self.memory_map.as_ptr_range().start as usize..self.memory_map.as_ptr_range().end as usize
     }
 }
