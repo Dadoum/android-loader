@@ -6,13 +6,23 @@ mod hook_manager;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::os::raw::c_char;
     use std::ffi::CString;
+    use rand::Rng;
+
     use crate::android_loader::AndroidLoader;
 
+    extern "C" fn arc4random() -> u32 {
+        rand::thread_rng().gen()
+    }
+    
     #[test]
     fn load_android_libraries() {
-        let store_services_core = AndroidLoader::load_library("lib/x86_64/libstoreservicescore.so").expect("Cannot load StoreServicesCore");
+        let mut hooks = HashMap::new();
+        hooks.insert("arc4random".to_owned(), arc4random as usize);
+
+        let store_services_core = AndroidLoader::load_library_with_hooks("lib/x86_64/libstoreservicescore.so", hooks).expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");
         let load_library_with_path: extern "C" fn(*const c_char) -> i32 = unsafe { std::mem::transmute(store_services_core.get_symbol("kq56gsgHG6").unwrap()) }; // Sph98paBcz abort

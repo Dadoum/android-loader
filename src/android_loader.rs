@@ -34,8 +34,11 @@ impl AndroidLoader {
     }
 
     unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
-        let parent_hooks = hook_manager::get_hooks(get_range(get_caller()).unwrap()).unwrap();
-        println!("Caller: {:p}", get_caller() as *const ());
+        let caller = get_caller();
+        println!("Caller: {:p}", caller as *const ());
+        let parent_hooks = hook_manager::get_hooks(get_range(caller).unwrap()).unwrap();
+        println!("Parent hooks: {:?}", parent_hooks);
+        //println!("Caller: {:p}", get_caller() as *const ());
         let name = CStr::from_ptr(name).to_str().unwrap();
         println!("Library requested: {}", name);
         match Self::load_library_with_hooks(name, parent_hooks) {
@@ -78,8 +81,6 @@ impl AndroidLoader {
         } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
             *sym
         // Couldn't find a symbol :(
-        } else if symbol_name == "arc4random" {
-            Self::arc4random as *const ()
         } else {
             Self::undefined_symbol_stub as *const ()
         }
