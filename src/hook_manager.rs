@@ -31,13 +31,7 @@ pub fn get_hooks(range: Range<usize>) -> Option<HashMap<String, usize>> {
     hooks.get(&range).cloned()
 }
 
-/// Add a hook to the given range
-pub fn add_hook(range: Range<usize>, name: &str, ptr: usize) {
-    let mut hooks = HOOKS.lock().unwrap();
-    let hook_list = hooks.entry(range).or_insert(HashMap::new());
-    hook_list.insert(name.to_owned(), ptr);
-}
-
+/// Set the list of hooks for the given range
 pub fn set_hooks(range: Range<usize>, hooks: HashMap<String, usize>) {
     let mut hook_list = HOOKS.lock().unwrap();
     hook_list.insert(range, hooks);
