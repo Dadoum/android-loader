@@ -1,5 +1,43 @@
 use lazy_static::lazy_static;
 use std::{arch::asm, collections::HashMap, ops::Range, sync::Mutex};
+
+lazy_static! {
+    // Create a Mutex, surrounding a HashMap of Range<usize> -> HashMap<String, usize>
+    // The Range<usize> is the range of memory that the library is mapped to
+    // The HashMap<String, usize> is the list of hooks, where the key is the name of the hook, and the value is the address of the hook
+    static ref HOOKS: Mutex<HashMap<Range<usize>, HashMap<String, usize>>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Get the range containing the given point, or None if no range contains it
+pub fn get_range(point: usize) -> Option<Range<usize>> {
+    let mut range = None;
+    // Get the lock on the global HashMap
+    let hooks = HOOKS.lock().unwrap();
+    // Iterate over the keys of the HashMap
+    for (key, _) in hooks.iter() {
+        // If the key contains the point, we found the range
+        if key.contains(&point) {
+            range = Some(key.start..key.end);
+            break;
+        }
+    }
+    range
+}
+
+/// Get the list of hooks for the given range, or None if no such range exists
+pub fn get_hooks(range: Range<usize>) -> Option<HashMap<String, usize>> {
+    let hooks = HOOKS.lock().unwrap();
+    hooks.get(&range).cloned()
+}
+
+/// Add a hook to the given range
+pub fn add_hook(range: Range<usize>, name: &str, ptr: usize) {
+    let mut hooks = HOOKS.lock().unwrap();
+    let hook_list = hooks.entry(range).or_insert(HashMap::new());
+    hook_list.insert(name.to_owned(), ptr);
+}
+
 #[inline(always)]
 #[cfg(target_arch = "aarch64")]
 /// Get the caller of the current function
@@ -21,52 +59,4 @@ pub fn get_caller() -> usize {
     let rbp: usize;
     unsafe { asm!("mov {}, rbp", out(reg) rbp) };
     rbp
-}
-
-pub struct Hook {
-    original: usize,
-    hook: usize,
-    caller: usize,
-}
-
-impl Clone for Hook {
-    fn clone(&self) -> Self {
-        Hook {
-            original: self.original,
-            hook: self.hook,
-            caller: self.caller,
-        }
-    }
-}
-
-//struct HookList {
-//   hooks: Vec<Hook>,
-//}
-
-// Global HashMap of memory range -> HookList
-lazy_static! {
-    static ref HOOKS: Mutex<HashMap<Range<usize>, Vec<Hook>>> = Mutex::new(HashMap::new());
-}
-
-pub fn get_range(point: usize) -> Range<usize> {
-    let mut range = Range { start: 0, end: 0 };
-    let hooks = HOOKS.lock().unwrap();
-    for (key, _) in hooks.iter() {
-        if key.contains(&point) {
-            range = key.start..key.end;
-            break;
-        }
-    }
-    range
-}
-
-pub fn get_hooks(range: Range<usize>) -> Option<Vec<Hook>> {
-    let hooks = HOOKS.lock().unwrap();
-    hooks.get(&range).cloned()
-}
-
-pub fn add_hook(range: Range<usize>, hook: Hook) {
-    let mut hooks = HOOKS.lock().unwrap();
-    let hook_list = hooks.entry(range).or_insert(Vec::new());
-    hook_list.push(hook);
 }
