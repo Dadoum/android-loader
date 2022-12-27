@@ -27,7 +27,7 @@ impl AndroidLoader {
         panic!("tried to call an undefined symbol");
     }
 
-    pub unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+    unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
         let name = CStr::from_ptr(name).to_str().unwrap();
         println!("Library requested: {}", name);
         match Self::load_library(name) {
@@ -36,7 +36,7 @@ impl AndroidLoader {
         }
     }
 
-    pub unsafe extern "C" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
+    unsafe extern "C" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
         let symbol = CStr::from_ptr(symbol).to_str().unwrap();
         println!("Symbol requested: {}", symbol);
         match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
@@ -45,7 +45,7 @@ impl AndroidLoader {
         }
     }
 
-    pub unsafe extern "C" fn dlclose(library: *mut AndroidLibrary) {
+    unsafe extern "C" fn dlclose(library: *mut AndroidLibrary) {
         let _ = Box::from_raw(library);
     }
 
@@ -85,14 +85,14 @@ impl AndroidLoader {
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
-        let relocated = (symbol as usize + addend).to_ne_bytes();
+        let relocated = addend.wrapping_add(symbol as usize).to_ne_bytes();
 
         let offset = entry.offset as usize;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
     fn relative_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let relocated = (library.memory_map.as_mut_ptr() as usize + addend).to_ne_bytes();
+        let relocated = addend.wrapping_add(library.memory_map.as_mut_ptr() as usize).to_ne_bytes();
 
         let offset = entry.offset as usize;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
@@ -166,7 +166,6 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         program_header: &ProgramHeader,
         region: &[u8],
     ) -> Result<(), ElfLoaderErr> {
-        // let offset = program_header.offset() as usize;
         let virtual_addr = program_header.virtual_addr() as usize;
         let mem_size = program_header.mem_size() as usize;
         let file_size = program_header.file_size() as usize;
@@ -208,16 +207,30 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         entry: RelocationEntry,
     ) -> Result<(), ElfLoaderErr> {
         match entry.rtype {
-            RelocationType::x86(relocation) => match relocation {
-                x86::RelocationTypes::R_386_GLOB_DAT
-                | x86::RelocationTypes::R_386_JMP_SLOT
-                | x86::RelocationTypes::R_386_32 => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+            RelocationType::x86(relocation) => {
+                let addend = usize::from_ne_bytes(library.memory_map[entry.offset as usize..entry.offset as usize + std::mem::size_of::<usize>()].try_into().unwrap());
+                match relocation {
+                    x86::RelocationTypes::R_386_GLOB_DAT
+                    | x86::RelocationTypes::R_386_JMP_SLOT => {
+                        Self::absolute_reloc(library, entry, 0);
+                        Ok(())
+                    }
 
-                x86::RelocationTypes::R_386_RELATIVE => {
-                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    x86::RelocationTypes::R_386_RELATIVE => {
+                        Self::relative_reloc(library, entry, addend);
+                        Ok(())
+                    }
+
+                    x86::RelocationTypes::R_386_32 => {
+                        Self::absolute_reloc(library, entry, addend);
+                        Ok(())
+                    }
+
+                    _ => {
+                        eprintln!("Unhandled relocation: {:?}", relocation);
+                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    }
                 }
-
-                _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
             },
 
             RelocationType::x86_64(relocation) => {
@@ -238,22 +251,37 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                         Ok(())
                     }
 
-                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+                    _ => {
+                        eprintln!("Unhandled relocation: {:?}", relocation);
+                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    }
                 }
             }
 
-            RelocationType::Arm(relocation) => match relocation {
-                arm::RelocationTypes::R_ARM_JUMP_SLOT
-                | arm::RelocationTypes::R_ARM_GLOB_DAT
-                | arm::RelocationTypes::R_ARM_ABS32 => {
-                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
-                }
+            RelocationType::Arm(relocation) => {
+                let addend = usize::from_ne_bytes(library.memory_map[entry.offset as usize..entry.offset as usize + std::mem::size_of::<usize>()].try_into().unwrap());
+                match relocation {
+                    arm::RelocationTypes::R_ARM_GLOB_DAT
+                    | arm::RelocationTypes::R_ARM_JUMP_SLOT => {
+                        Self::absolute_reloc(library, entry, 0);
+                        Ok(())
+                    }
 
-                arm::RelocationTypes::R_ARM_RELATIVE => {
-                    Err(ElfLoaderErr::UnsupportedRelocationEntry)
-                }
+                    arm::RelocationTypes::R_ARM_RELATIVE => {
+                        Self::relative_reloc(library, entry, addend);
+                        Ok(())
+                    }
 
-                _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+                    arm::RelocationTypes::R_ARM_ABS32 => {
+                        Self::absolute_reloc(library, entry, addend);
+                        Ok(())
+                    }
+
+                    _ => {
+                        eprintln!("Unhandled relocation: {:?}", relocation);
+                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    }
+                }
             },
 
             RelocationType::AArch64(relocation) => {
@@ -274,7 +302,10 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                         Ok(())
                     }
 
-                    _ => Err(ElfLoaderErr::UnsupportedRelocationEntry),
+                    _ => {
+                        eprintln!("Unhandled relocation: {:?}", relocation);
+                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                    }
                 }
             }
         }
