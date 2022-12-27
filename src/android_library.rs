@@ -24,8 +24,4 @@ impl AndroidLibrary {
             .find(|s| s.name == symbol_name)
             .map(|s| unsafe { self.memory_map.as_ptr().offset(s.value as isize) as *const () })
     }
-
-    pub fn get_range(&self) -> Range<usize> {
-        self.memory_map.as_ptr_range().start as usize..self.memory_map.as_ptr_range().end as usize
-    }
 }
