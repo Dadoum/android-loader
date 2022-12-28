@@ -1,12 +1,12 @@
 use crate::android_library::{AndroidLibrary, Symbol};
 use crate::hook_manager;
 use anyhow::Result;
-use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
 use elfloader::{
     ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType,
 };
 use memmap2::MmapOptions;
+use libc::{chmod, close, free, fstat, ftruncate, gettimeofday, lstat, malloc, mkdir, open, read, strncpy, umask, write};
 use region::Protection;
 use std::cmp::max;
 use std::collections::HashMap;
@@ -79,21 +79,8 @@ impl AndroidLoader {
         if let Some(func) = library.hooks.get(symbol_name) {
             *func as *const ()
         // pthread functions are problematic, let's ignore them
-        } else if symbol_name.starts_with("pthread_") {
-            Self::pthread_stub as *const ()
-        } else if symbol_name == "dlopen" {
-            // TODO find a better way to do this
-            Self::dlopen as *const ()
-        } else if symbol_name == "dlsym" {
-            Self::dlsym as *const ()
-        } else if symbol_name == "dlclose" {
-            Self::dlclose as *const ()
-        // Look it up in libc
-        } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
-            *sym
-        // Couldn't find a symbol :(
         } else {
-            Self::undefined_symbol_stub as *const ()
+            Self::get_libc_symbol(symbol_name)
         }
     }
 
@@ -105,21 +92,36 @@ impl AndroidLoader {
         if let Some(func) = get_hooks().get(symbol_name) {
             *func as *const ()
         // pthread functions are problematic, let's ignore them
-        } else if symbol_name.starts_with("pthread_") {
-            Self::pthread_stub as *const ()
-        } else if symbol_name == "dlopen" {
-            // TODO find a better way to do this
-            Self::dlopen as *const ()
-        } else if symbol_name == "dlsym" {
-            Self::dlsym as *const ()
-        } else if symbol_name == "dlclose" {
-            Self::dlclose as *const ()
-        // Look it up in libc
-        } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
-            *sym
-        // Couldn't find a symbol :(
         } else {
-            Self::undefined_symbol_stub as *const ()
+            Self::get_libc_symbol(symbol_name)
+        }
+    }
+
+    fn get_libc_symbol(symbol_name: &str) -> *const () {
+        if symbol_name.starts_with("pthread_") {
+            Self::pthread_stub as *const ()
+        } else {
+            match symbol_name {
+                "dlopen" => Self::dlopen as *const (),
+                "dlsym" => Self::dlsym as *const (),
+                "dlclose" => Self::dlclose as *const (),
+                // Look it up in libc
+                "chmod" => chmod as *const (),
+                "close" => close as *const (),
+                "free" => free as *const (),
+                "fstat" => fstat as *const (),
+                "ftruncate" => ftruncate as *const (),
+                "gettimeofday" => gettimeofday as *const (),
+                "lstat" => lstat as *const (),
+                "malloc" => malloc as *const (),
+                "mkdir" => mkdir as *const (),
+                "open" => open as *const (),
+                "read" => read as *const (),
+                "strncpy" => strncpy as *const (),
+                "umask" => umask as *const (),
+                "write" => write as *const (),
+                _ => Self::undefined_symbol_stub as *const ()
+            }
         }
     }
 
@@ -222,8 +224,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 Ok(AndroidLibrary {
                     memory_map: map,
                     symbols,
-                    hooks,
-                    libc: Library::open_self().unwrap(),
+                    hooks
                 })
             }
             #[cfg(not(feature = "hacky_hooks"))]
@@ -232,7 +233,6 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 Ok(AndroidLibrary {
                     memory_map: map,
                     symbols,
-                    libc: Library::open_self().unwrap(),
                 })
             }
         } else {
@@ -259,21 +259,23 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             start_addr as usize, end_addr as usize, mem_size, file_size
         );
 
+        let is_4k_page = region::page::size() == 4096;
+
         let flags = program_header.flags();
         let mut prot = Protection::NONE.bits();
-        if flags.is_read() {
+        if flags.is_read() || !is_4k_page {
             print!("R");
             prot |= Protection::READ.bits();
         } else {
             print!("-");
         }
-        if flags.is_write() {
+        if flags.is_write() || !is_4k_page {
             print!("W");
             prot |= Protection::WRITE.bits();
         } else {
             print!("-");
         }
-        if flags.is_execute() {
+        if flags.is_execute() || !is_4k_page {
             println!("X]");
             prot |= Protection::EXECUTE.bits();
         } else {
