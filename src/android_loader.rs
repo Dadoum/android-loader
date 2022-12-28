@@ -6,7 +6,6 @@ use elfloader::{
     ElfBinary, ElfLoader, ElfLoaderErr, LoadableHeaders, RelocationEntry, RelocationType,
 };
 use memmap2::MmapOptions;
-use libc::{chmod, close, free, fstat, ftruncate, gettimeofday, lstat, malloc, mkdir, open, read, strncpy, umask, write};
 use region::Protection;
 use std::cmp::max;
 use std::collections::HashMap;
@@ -105,21 +104,6 @@ impl AndroidLoader {
                 "dlopen" => Self::dlopen as *const (),
                 "dlsym" => Self::dlsym as *const (),
                 "dlclose" => Self::dlclose as *const (),
-                // Look it up in libc
-                "chmod" => chmod as *const (),
-                "close" => close as *const (),
-                "free" => free as *const (),
-                "fstat" => fstat as *const (),
-                "ftruncate" => ftruncate as *const (),
-                "gettimeofday" => gettimeofday as *const (),
-                "lstat" => lstat as *const (),
-                "malloc" => malloc as *const (),
-                "mkdir" => mkdir as *const (),
-                "open" => open as *const (),
-                "read" => read as *const (),
-                "strncpy" => strncpy as *const (),
-                "umask" => umask as *const (),
-                "write" => write as *const (),
                 _ => Self::undefined_symbol_stub as *const ()
             }
         }
