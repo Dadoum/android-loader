@@ -1,4 +1,5 @@
 use crate::android_library::{AndroidLibrary, Symbol};
+use crate::hook_manager;
 use anyhow::Result;
 use dlopen2::symbor::Library;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
@@ -8,17 +9,16 @@ use elfloader::{
 use memmap2::MmapOptions;
 use region::Protection;
 use std::cmp::max;
-use std::os::raw::{c_char, c_void};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
+use std::os::raw::{c_char, c_void};
 use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::symbol_table::Entry;
-use rand::Rng;
 
-pub struct AndroidLoader {
-}
+pub struct AndroidLoader {}
 
 impl AndroidLoader {
     extern "C" fn pthread_stub() -> i32 {
@@ -29,12 +29,34 @@ impl AndroidLoader {
         panic!("tried to call an undefined symbol");
     }
 
+    #[cfg(feature = "hacky_hooks")]
     unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        use crate::hook_manager::{get_caller, get_hooks, get_range};
+
+        let caller = get_caller();
+        println!("Caller: {:p}", caller as *const ());
+        let parent_hooks = get_hooks(get_range(caller).unwrap()).unwrap();
+        println!("Parent hooks: {:?}", parent_hooks);
+        //println!("Caller: {:p}", get_caller() as *const ());
         let name = CStr::from_ptr(name).to_str().unwrap();
         println!("Library requested: {}", name);
-        match Self::load_library(name) {
+        match Self::load_library_with_hooks(name, parent_hooks) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
-            Err(_) => null_mut()
+            Err(_) => null_mut(),
+        }
+    }
+
+    #[cfg(not(feature = "hacky_hooks"))]
+    unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+        use crate::hook_manager::get_hooks;
+
+        let hooks = get_hooks();
+        println!("Hooks: {:?}", hooks);
+        let name = CStr::from_ptr(name).to_str().unwrap();
+        println!("Library requested: {}", name);
+        match Self::load_library_with_hooks(name, hooks) {
+            Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
+            Err(_) => null_mut(),
         }
     }
 
@@ -43,7 +65,7 @@ impl AndroidLoader {
         println!("Symbol requested: {}", symbol);
         match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
             Some(func) => func as *mut c_void,
-            None => null_mut()
+            None => null_mut(),
         }
     }
 
@@ -51,18 +73,16 @@ impl AndroidLoader {
         let _ = Box::from_raw(library);
     }
 
-    unsafe extern "C" fn arc4random() -> u32 {
-        rand::thread_rng().gen()
-    }
-
+    #[cfg(feature = "hacky_hooks")]
     fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
-        // First we check if the library wants specific symbols
-        if let Some(func) = (library.symbol_loader)(symbol_name) {
-            func as *const ()
+        // Check if this function is hooked for this library
+        if let Some(func) = library.hooks.get(symbol_name) {
+            *func as *const ()
         // pthread functions are problematic, let's ignore them
         } else if symbol_name.starts_with("pthread_") {
             Self::pthread_stub as *const ()
-        } else if symbol_name == "dlopen" { // TODO find a better way to do this
+        } else if symbol_name == "dlopen" {
+            // TODO find a better way to do this
             Self::dlopen as *const ()
         } else if symbol_name == "dlsym" {
             Self::dlsym as *const ()
@@ -72,18 +92,49 @@ impl AndroidLoader {
         } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
             *sym
         // Couldn't find a symbol :(
-        } else if symbol_name == "arc4random" {
-            Self::arc4random as *const ()
+        } else {
+            Self::undefined_symbol_stub as *const ()
+        }
+    }
+
+    #[cfg(not(feature = "hacky_hooks"))]
+    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
+        // Check if this function is hooked for this library
+        use crate::hook_manager::get_hooks;
+
+        if let Some(func) = get_hooks().get(symbol_name) {
+            *func as *const ()
+        // pthread functions are problematic, let's ignore them
+        } else if symbol_name.starts_with("pthread_") {
+            Self::pthread_stub as *const ()
+        } else if symbol_name == "dlopen" {
+            // TODO find a better way to do this
+            Self::dlopen as *const ()
+        } else if symbol_name == "dlsym" {
+            Self::dlsym as *const ()
+        } else if symbol_name == "dlclose" {
+            Self::dlclose as *const ()
+        // Look it up in libc
+        } else if let Ok(sym) = unsafe { library.libc.symbol(symbol_name) } {
+            *sym
+        // Couldn't find a symbol :(
         } else {
             Self::undefined_symbol_stub as *const ()
         }
     }
 
     pub fn load_library(path: &str) -> Result<AndroidLibrary> {
+        Self::load_library_with_hooks(path, HashMap::new())
+    }
+
+    pub fn load_library_with_hooks(
+        path: &str,
+        hooks: HashMap<String, usize>,
+    ) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
-        Ok(bin.load::<Self, AndroidLibrary>()?)
+        Ok(bin.load::<Self, AndroidLibrary>(hooks)?)
     }
 }
 
@@ -100,7 +151,9 @@ impl AndroidLoader {
     }
 
     fn relative_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let relocated = addend.wrapping_add(library.memory_map.as_mut_ptr() as usize).to_ne_bytes();
+        let relocated = addend
+            .wrapping_add(library.memory_map.as_mut_ptr() as usize)
+            .to_ne_bytes();
 
         let offset = entry.offset as usize;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
@@ -111,6 +164,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
     fn allocate(
         load_headers: LoadableHeaders,
         elf_binary: &ElfBinary,
+        hooks: HashMap<String, usize>,
     ) -> Result<AndroidLibrary, ElfLoaderErr> {
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
@@ -118,7 +172,10 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         for header in load_headers {
             if header.get_type() == Ok(Type::Load) {
                 let start = region::page::floor(header.virtual_addr() as *const ()) as usize;
-                let end = region::page::ceil((start as usize + max(header.file_size(), header.mem_size()) as usize) as *const ()) as usize;
+                let end = region::page::ceil(
+                    (start as usize + max(header.file_size(), header.mem_size()) as usize)
+                        as *const (),
+                ) as usize;
 
                 if start < minimum {
                     minimum = start;
@@ -156,12 +213,28 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         };
 
         if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
-            Ok(AndroidLibrary {
-                memory_map: map,
-                symbols,
-                symbol_loader: |_| None,
-                libc: Library::open_self().unwrap(),
-            })
+            #[cfg(feature = "hacky_hooks")]
+            {
+                hook_manager::set_hooks(
+                    map.as_ptr_range().start as usize..map.as_ptr_range().end as usize,
+                    hooks.clone(),
+                );
+                Ok(AndroidLibrary {
+                    memory_map: map,
+                    symbols,
+                    hooks,
+                    libc: Library::open_self().unwrap(),
+                })
+            }
+            #[cfg(not(feature = "hacky_hooks"))]
+            {
+                hook_manager::add_hooks(hooks);
+                Ok(AndroidLibrary {
+                    memory_map: map,
+                    symbols,
+                    libc: Library::open_self().unwrap(),
+                })
+            }
         } else {
             Err(ElfLoaderErr::ElfParser {
                 source: "Memory mapping failed!",
@@ -181,7 +254,10 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
 
         let start_addr = region::page::floor((addr + virtual_addr) as *const c_void) as *mut c_void;
         let end_addr = region::page::ceil((addr + virtual_addr + mem_size) as *const c_void);
-        print!("{:x} - {:x} (mem_sz: {}, file_sz: {}) [", start_addr as usize, end_addr as usize, mem_size, file_size);
+        print!(
+            "{:x} - {:x} (mem_sz: {}, file_sz: {}) [",
+            start_addr as usize, end_addr as usize, mem_size, file_size
+        );
 
         let flags = program_header.flags();
         let mut prot = Protection::NONE.bits();
@@ -205,21 +281,29 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         }
         library.memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(region);
 
-        unsafe { region::protect(start_addr, end_addr as usize - start_addr as usize, Protection::from_bits_truncate(prot)).unwrap() };
+        unsafe {
+            region::protect(
+                start_addr,
+                end_addr as usize - start_addr as usize,
+                Protection::from_bits_truncate(prot),
+            )
+            .unwrap()
+        };
 
         Ok(())
     }
 
-    fn relocate(
-        library: &mut AndroidLibrary,
-        entry: RelocationEntry,
-    ) -> Result<(), ElfLoaderErr> {
+    fn relocate(library: &mut AndroidLibrary, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
         match entry.rtype {
             RelocationType::x86(relocation) => {
-                let addend = usize::from_ne_bytes(library.memory_map[entry.offset as usize..entry.offset as usize + std::mem::size_of::<usize>()].try_into().unwrap());
+                let addend = usize::from_ne_bytes(
+                    library.memory_map[entry.offset as usize
+                        ..entry.offset as usize + std::mem::size_of::<usize>()]
+                        .try_into()
+                        .unwrap(),
+                );
                 match relocation {
-                    x86::RelocationTypes::R_386_GLOB_DAT
-                    | x86::RelocationTypes::R_386_JMP_SLOT => {
+                    x86::RelocationTypes::R_386_GLOB_DAT | x86::RelocationTypes::R_386_JMP_SLOT => {
                         Self::absolute_reloc(library, entry, 0);
                         Ok(())
                     }
@@ -239,7 +323,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                         Err(ElfLoaderErr::UnsupportedRelocationEntry)
                     }
                 }
-            },
+            }
 
             RelocationType::x86_64(relocation) => {
                 let addend = entry
@@ -267,7 +351,12 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             }
 
             RelocationType::Arm(relocation) => {
-                let addend = usize::from_ne_bytes(library.memory_map[entry.offset as usize..entry.offset as usize + std::mem::size_of::<usize>()].try_into().unwrap());
+                let addend = usize::from_ne_bytes(
+                    library.memory_map[entry.offset as usize
+                        ..entry.offset as usize + std::mem::size_of::<usize>()]
+                        .try_into()
+                        .unwrap(),
+                );
                 match relocation {
                     arm::RelocationTypes::R_ARM_GLOB_DAT
                     | arm::RelocationTypes::R_ARM_JUMP_SLOT => {
@@ -290,7 +379,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                         Err(ElfLoaderErr::UnsupportedRelocationEntry)
                     }
                 }
-            },
+            }
 
             RelocationType::AArch64(relocation) => {
                 let addend = entry
