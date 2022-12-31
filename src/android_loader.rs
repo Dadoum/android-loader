@@ -144,6 +144,12 @@ impl AndroidLoader {
         let offset = entry.offset as usize;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
+
+    #[cfg(not(target_arch="aarch64"))]
+    const MAX_PAGE_SIZE: usize = 4096;
+
+    #[cfg(target_arch="aarch64")]
+    const MAX_PAGE_SIZE: usize = 65536;
 }
 
 impl ElfLoader<AndroidLibrary> for AndroidLoader {
@@ -243,23 +249,23 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             start_addr as usize, end_addr as usize, mem_size, file_size
         );
 
-        let is_4k_page = region::page::size() == 4096;
+        let is_standard_page = region::page::size() < Self::MAX_PAGE_SIZE;
 
         let flags = program_header.flags();
         let mut prot = Protection::NONE.bits();
-        if flags.is_read() || !is_4k_page {
+        if flags.is_read() || !is_standard_page {
             print!("R");
             prot |= Protection::READ.bits();
         } else {
             print!("-");
         }
-        if flags.is_write() || !is_4k_page {
+        if flags.is_write() || !is_standard_page {
             print!("W");
             prot |= Protection::WRITE.bits();
         } else {
             print!("-");
         }
-        if flags.is_execute() || !is_4k_page {
+        if flags.is_execute() || !is_standard_page {
             println!("X]");
             prot |= Protection::EXECUTE.bits();
         } else {
