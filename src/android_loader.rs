@@ -1,4 +1,5 @@
-use crate::android_library::{AndroidLibrary, Symbol};
+use std::alloc::alloc;
+use crate::android_library::{AndroidLibrary, Shift, Symbol};
 use crate::hook_manager;
 use anyhow::Result;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
@@ -126,22 +127,26 @@ impl AndroidLoader {
 
 impl AndroidLoader {
     fn absolute_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+        let addr = library.memory_map.as_mut_ptr() as usize;
         let symbol = Self::symbol_finder(&library.symbols[entry.index as usize].name, library);
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
-        let relocated = addend.wrapping_add(symbol as usize).to_ne_bytes();
+        let val = addend.wrapping_add(symbol as usize);
+        let relocated = val.to_ne_bytes();
 
-        let offset = entry.offset as usize;
+        let offset = library.shift_address(addr + entry.offset as usize) - addr;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
     fn relative_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let relocated = addend
-            .wrapping_add(library.memory_map.as_mut_ptr() as usize)
-            .to_ne_bytes();
+        let addr = library.memory_map.as_mut_ptr() as usize;
+        let val = library.shift_address(addend
+            .wrapping_add(addr));
 
-        let offset = entry.offset as usize;
+        let relocated = val.to_ne_bytes();
+
+        let offset = library.shift_address(addr + entry.offset as usize) - addr;
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
@@ -204,7 +209,11 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             _ => Vec::new(),
         };
 
-        if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
+        let length = (region::page::ceil((alloc_end - alloc_start) as *const usize) as usize / 4096) * region::page::size();
+
+        if let Ok(map) = MmapOptions::new().len(length).map_anon() {
+            println!("Mapped {:x} to {:x}. (sanity check: {:x})", map.as_ptr() as usize, map.as_ptr() as usize + length, region::page::ceil((map.as_ptr() as usize + length) as *const usize) as usize);
+
             #[cfg(feature = "hacky_hooks")]
             {
                 hook_manager::set_hooks(
@@ -213,6 +222,8 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 );
                 Ok(AndroidLibrary {
                     memory_map: map,
+                    address_shifts: Vec::new(),
+                    last_address: 0,
                     symbols,
                     hooks
                 })
@@ -222,6 +233,8 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
                 hook_manager::add_hooks(hooks);
                 Ok(AndroidLibrary {
                     memory_map: map,
+                    address_shifts: Vec::new(),
+                    last_address: 0,
                     symbols,
                 })
             }
@@ -242,14 +255,24 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         let file_size = program_header.file_size() as usize;
         let addr = library.memory_map.as_ptr() as usize;
 
-        let start_addr = region::page::floor((addr + virtual_addr) as *const c_void) as *mut c_void;
-        let end_addr = region::page::ceil((addr + virtual_addr + mem_size) as *const c_void);
+        if library.shift_address(addr + virtual_addr) < library.last_address {
+            println!("Shift needed; addr: {:x}, last_addr: {:x}", addr + virtual_addr, library.last_address);
+            library.address_shifts.push(Shift {
+                from: addr + virtual_addr,
+                shift: library.last_address - (addr + virtual_addr)
+            });
+        }
+
+        let shifted_start = library.shift_address(addr + virtual_addr) as usize;
+        let shifted_end = library.shift_address(addr + virtual_addr + mem_size) as usize;
+        let start_addr = region::page::floor(shifted_start as *const c_void) as *mut c_void;
+        let end_addr = region::page::ceil(shifted_end as *const c_void);
         print!(
             "{:x} - {:x} (mem_sz: {}, file_sz: {}) [",
             start_addr as usize, end_addr as usize, mem_size, file_size
         );
 
-        let is_standard_page = region::page::size() < Self::MAX_PAGE_SIZE;
+        let is_standard_page = true; // region::page::size() <= Self::MAX_PAGE_SIZE;
 
         let flags = program_header.flags();
         let mut prot = Protection::NONE.bits();
@@ -265,14 +288,18 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         } else {
             print!("-");
         }
+
         if flags.is_execute() || !is_standard_page {
             println!("X]");
             prot |= Protection::EXECUTE.bits();
         } else {
             println!("-]");
         }
-        library.memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(region);
 
+        println!("Writing...");
+        library.memory_map[shifted_start - addr..shifted_start + file_size - addr].copy_from_slice(region);
+
+        println!("Protecting...");
         unsafe {
             region::protect(
                 start_addr,
@@ -281,6 +308,9 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             )
             .unwrap()
         };
+
+        println!("Done !");
+        library.last_address = end_addr as usize;
 
         Ok(())
     }

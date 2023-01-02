@@ -18,8 +18,11 @@ mod tests {
         rand::thread_rng().gen()
     }
 
+
     #[test]
     fn load_android_libraries() {
+        println!("Page size: {}", region::page::size());
+
         let mut hooks = HashMap::new();
         hooks.insert("arc4random".to_owned(), arc4random as usize);
         hooks.insert("chmod".to_owned(), chmod as usize);
