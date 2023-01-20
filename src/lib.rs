@@ -2,7 +2,7 @@ extern crate core;
 
 pub mod android_library;
 pub mod android_loader;
-mod hook_manager;
+pub mod hook_manager;
 
 #[cfg(test)]
 mod tests {
