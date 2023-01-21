@@ -249,7 +249,7 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
             start_addr as usize, end_addr as usize, mem_size, file_size
         );
 
-        let is_standard_page = region::page::size() < Self::MAX_PAGE_SIZE;
+        let is_standard_page = region::page::size() <= Self::MAX_PAGE_SIZE;
 
         let flags = program_header.flags();
         let mut prot = Protection::NONE.bits();
