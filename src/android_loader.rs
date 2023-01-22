@@ -20,16 +20,16 @@ use xmas_elf::symbol_table::Entry;
 pub struct AndroidLoader {}
 
 impl AndroidLoader {
-    extern "C" fn pthread_stub() -> i32 {
+    extern "sysv64" fn pthread_stub() -> i32 {
         0
     }
 
-    extern "C" fn undefined_symbol_stub() {
+    extern "sysv64" fn undefined_symbol_stub() {
         panic!("tried to call an undefined symbol");
     }
 
     #[cfg(feature = "hacky_hooks")]
-    unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+    unsafe extern "sysv64" fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::{get_caller, get_hooks, get_range};
 
         let caller = get_caller();
@@ -46,7 +46,7 @@ impl AndroidLoader {
     }
 
     #[cfg(not(feature = "hacky_hooks"))]
-    unsafe extern "C" fn dlopen(name: *const c_char) -> *mut c_void {
+    unsafe extern "sysv64" fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::get_hooks;
 
         let hooks = get_hooks();
@@ -59,7 +59,7 @@ impl AndroidLoader {
         }
     }
 
-    unsafe extern "C" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
+    unsafe extern "sysv64" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
         let symbol = CStr::from_ptr(symbol).to_str().unwrap();
         println!("Symbol requested: {}", symbol);
         match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
@@ -68,7 +68,7 @@ impl AndroidLoader {
         }
     }
 
-    unsafe extern "C" fn dlclose(library: *mut AndroidLibrary) {
+    unsafe extern "sysv64" fn dlclose(library: *mut AndroidLibrary) {
         let _ = Box::from_raw(library);
     }
 
