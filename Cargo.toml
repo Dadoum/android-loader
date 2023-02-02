@@ -18,4 +18,5 @@ libc = "0.2.139"
 memmap2 = "0.5.8"
 rand = "0.8.4"
 region = "3.0.0"
+sysv64 = { path = "./sysv64" }
 xmas-elf = "0.8"

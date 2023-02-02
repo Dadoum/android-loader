@@ -4,6 +4,8 @@ pub mod android_library;
 pub mod android_loader;
 pub mod hook_manager;
 
+pub use sysv64::*;
+
 #[cfg(test)]
 mod tests {
     use rand::Rng;
@@ -13,8 +15,10 @@ mod tests {
     use libc::{chmod, close, free, fstat, ftruncate, gettimeofday, lstat, malloc, mkdir, open, read, strncpy, umask, write};
 
     use crate::android_loader::AndroidLoader;
+    use crate::{sysv64, sysv64_type};
 
-    extern "sysv64" fn arc4random() -> u32 {
+    #[sysv64]
+    fn arc4random() -> u32 {
         rand::thread_rng().gen()
     }
 
@@ -42,13 +46,13 @@ mod tests {
                 .expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");
-        let load_library_with_path: extern "sysv64" fn(*const c_char) -> i32 =
+        let load_library_with_path: sysv64_type!(fn(*const c_char) -> i32) =
             unsafe { std::mem::transmute(store_services_core.get_symbol("kq56gsgHG6").unwrap()) }; // Sph98paBcz abort
         let library_path = CString::new("lib/x86_64/").unwrap();
         let ret = load_library_with_path(library_path.as_ptr() as *const c_char);
         println!("provisioning path, ADI returned {}", ret);
 
-        let set_android_identifier: extern "sysv64" fn(*const c_char, u32) -> i32 =
+        let set_android_identifier: sysv64_type!(fn(*const c_char, u32) -> i32) =
             unsafe { std::mem::transmute(store_services_core.get_symbol("Sph98paBcz").unwrap()) }; // Sph98paBcz abort
                                                                                                    // println!("{:p}", set_android_identifier as *const ());
         let identifier = "f213456789abcde0";

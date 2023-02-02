@@ -1,5 +1,6 @@
 use crate::android_library::{AndroidLibrary, Symbol};
 use crate::hook_manager;
+use crate::sysv64;
 use anyhow::Result;
 use elfloader::arch::{aarch64, arm, x86, x86_64};
 use elfloader::{
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::os::raw::{c_char, c_void};
+use std::path::PathBuf;
 use std::ptr::null_mut;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::SectionData;
@@ -20,16 +22,19 @@ use xmas_elf::symbol_table::Entry;
 pub struct AndroidLoader {}
 
 impl AndroidLoader {
-    extern "sysv64" fn pthread_stub() -> i32 {
+    #[sysv64]
+    fn pthread_stub() -> i32 {
         0
     }
 
-    extern "sysv64" fn undefined_symbol_stub() {
+    #[sysv64]
+    fn undefined_symbol_stub() {
         panic!("tried to call an undefined symbol");
     }
 
     #[cfg(feature = "hacky_hooks")]
-    unsafe extern "sysv64" fn dlopen(name: *const c_char) -> *mut c_void {
+    #[sysv64]
+    unsafe fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::{get_caller, get_hooks, get_range};
 
         let caller = get_caller();
@@ -46,20 +51,32 @@ impl AndroidLoader {
     }
 
     #[cfg(not(feature = "hacky_hooks"))]
-    unsafe extern "sysv64" fn dlopen(name: *const c_char) -> *mut c_void {
+    #[sysv64]
+    unsafe fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::get_hooks;
 
         let hooks = get_hooks();
-        println!("Hooks: {:?}", hooks);
-        let name = CStr::from_ptr(name).to_str().unwrap();
-        println!("Library requested: {}", name);
-        match Self::load_library_with_hooks(name, hooks) {
+        let path_str = CStr::from_ptr(name).to_str().unwrap();
+
+        #[cfg(target_family = "windows")]
+        let path_str = path_str.chars()
+            .map(|x| match x {
+                '\\' => '/',
+                c => c
+            }).collect::<String>();
+
+        #[cfg(target_family = "windows")]
+        let path_str = path_str.as_str();
+
+        println!("Loading {}", path_str);
+        match Self::load_library_with_hooks(path_str, hooks) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
             Err(_) => null_mut(),
         }
     }
 
-    unsafe extern "sysv64" fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
+    #[sysv64]
+    unsafe fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
         let symbol = CStr::from_ptr(symbol).to_str().unwrap();
         println!("Symbol requested: {}", symbol);
         match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
@@ -68,7 +85,8 @@ impl AndroidLoader {
         }
     }
 
-    unsafe extern "sysv64" fn dlclose(library: *mut AndroidLibrary) {
+    #[sysv64]
+    unsafe fn dlclose(library: *mut AndroidLibrary) {
         let _ = Box::from_raw(library);
     }
 
