@@ -37,15 +37,16 @@ impl AndroidLoader {
         use crate::hook_manager::get_hooks;
         let mut path_str = CStr::from_ptr(name).to_str().unwrap();
 
+        let _path: String;
         #[cfg(target_family = "windows")]
         {
-            path_str = path_str.chars()
+            _path = path_str.chars()
                 .map(|x| match x {
                     '\\' => '/',
                     c => c
                 }).collect::<String>();
 
-            path_str = path_str.as_str();
+            path_str = _path.as_str();
         }
 
         println!("Loading {}", path_str);
