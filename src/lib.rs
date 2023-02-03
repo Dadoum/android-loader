@@ -40,9 +40,10 @@ mod tests {
         hooks.insert("strncpy".to_owned(), strncpy as usize);
         hooks.insert("umask".to_owned(), umask as usize);
         hooks.insert("write".to_owned(), write as usize);
+        crate::hook_manager::add_hooks(hooks);
 
         let store_services_core =
-            AndroidLoader::load_library_with_hooks("lib/x86_64/libstoreservicescore.so", hooks)
+            AndroidLoader::load_library("lib/x86_64/libstoreservicescore.so")
                 .expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");

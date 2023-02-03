@@ -5,11 +5,6 @@ edition = "2021"
 
 rust-version = "1.60"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-hacky_hooks = []
-
 [dependencies]
 anyhow = "1.0"
 elfloader = { git = "https://github.com/Dadoum/rust-elfloader" }

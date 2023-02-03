@@ -32,44 +32,24 @@ impl AndroidLoader {
         panic!("tried to call an undefined symbol");
     }
 
-    #[cfg(feature = "hacky_hooks")]
-    #[sysv64]
-    unsafe fn dlopen(name: *const c_char) -> *mut c_void {
-        use crate::hook_manager::{get_caller, get_hooks, get_range};
-
-        let caller = get_caller();
-        println!("Caller: {:p}", caller as *const ());
-        let parent_hooks = get_hooks(get_range(caller).unwrap()).unwrap();
-        println!("Parent hooks: {:?}", parent_hooks);
-        //println!("Caller: {:p}", get_caller() as *const ());
-        let name = CStr::from_ptr(name).to_str().unwrap();
-        println!("Library requested: {}", name);
-        match Self::load_library_with_hooks(name, parent_hooks) {
-            Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
-            Err(_) => null_mut(),
-        }
-    }
-
-    #[cfg(not(feature = "hacky_hooks"))]
     #[sysv64]
     unsafe fn dlopen(name: *const c_char) -> *mut c_void {
         use crate::hook_manager::get_hooks;
-
-        let hooks = get_hooks();
-        let path_str = CStr::from_ptr(name).to_str().unwrap();
+        let mut path_str = CStr::from_ptr(name).to_str().unwrap();
 
         #[cfg(target_family = "windows")]
-        let path_str = path_str.chars()
-            .map(|x| match x {
-                '\\' => '/',
-                c => c
-            }).collect::<String>();
+        {
+            path_str = path_str.chars()
+                .map(|x| match x {
+                    '\\' => '/',
+                    c => c
+                }).collect::<String>();
 
-        #[cfg(target_family = "windows")]
-        let path_str = path_str.as_str();
+            path_str = path_str.as_str();
+        }
 
         println!("Loading {}", path_str);
-        match Self::load_library_with_hooks(path_str, hooks) {
+        match Self::load_library(path_str) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
             Err(_) => null_mut(),
         }
@@ -90,23 +70,10 @@ impl AndroidLoader {
         let _ = Box::from_raw(library);
     }
 
-    #[cfg(feature = "hacky_hooks")]
-    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
+    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary, hooks: &HashMap<String, usize>) -> *const () {
         // Check if this function is hooked for this library
-        if let Some(func) = library.hooks.get(symbol_name) {
-            *func as *const ()
-        // pthread functions are problematic, let's ignore them
-        } else {
-            Self::get_libc_symbol(symbol_name)
-        }
-    }
 
-    #[cfg(not(feature = "hacky_hooks"))]
-    fn symbol_finder(symbol_name: &str, library: &AndroidLibrary) -> *const () {
-        // Check if this function is hooked for this library
-        use crate::hook_manager::get_hooks;
-
-        if let Some(func) = get_hooks().get(symbol_name) {
+        if let Some(func) = hooks.get(symbol_name) {
             *func as *const ()
         // pthread functions are problematic, let's ignore them
         } else {
@@ -128,23 +95,17 @@ impl AndroidLoader {
     }
 
     pub fn load_library(path: &str) -> Result<AndroidLibrary> {
-        Self::load_library_with_hooks(path, HashMap::new())
-    }
-
-    pub fn load_library_with_hooks(
-        path: &str,
-        hooks: HashMap<String, usize>,
-    ) -> Result<AndroidLibrary> {
         let file = fs::read(path)?;
         let bin = ElfBinary::new(file.as_slice())?;
 
-        Ok(bin.load::<Self, AndroidLibrary>(hooks)?)
+        Ok(bin.load::<Self, AndroidLibrary>()?)
     }
 }
 
 impl AndroidLoader {
-    fn absolute_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
-        let symbol = Self::symbol_finder(&library.symbols[entry.index as usize].name, library);
+    fn absolute_reloc(library: &mut AndroidLibrary, hooks: &HashMap<String, usize>, entry: &RelocationEntry, addend: usize) {
+        let name = &library.strings.get(&(entry.index as usize));
+        let symbol = Self::symbol_finder(name.unwrap(), library, hooks);
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
@@ -154,7 +115,7 @@ impl AndroidLoader {
         library.memory_map[offset..offset + relocated.len()].copy_from_slice(&relocated);
     }
 
-    fn relative_reloc(library: &mut AndroidLibrary, entry: RelocationEntry, addend: usize) {
+    fn relative_reloc(library: &mut AndroidLibrary, entry: &RelocationEntry, addend: usize) {
         let relocated = addend
             .wrapping_add(library.memory_map.as_mut_ptr() as usize)
             .to_ne_bytes();
@@ -173,8 +134,7 @@ impl AndroidLoader {
 impl ElfLoader<AndroidLibrary> for AndroidLoader {
     fn allocate(
         load_headers: LoadableHeaders,
-        elf_binary: &ElfBinary,
-        hooks: HashMap<String, usize>,
+        elf_binary: &ElfBinary
     ) -> Result<AndroidLibrary, ElfLoaderErr> {
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
@@ -202,47 +162,69 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         let alloc_end = region::page::ceil(maximum as *const ()) as usize;
         debug_assert!(alloc_end >= maximum);
 
-        let dyn_symbol_section = elf_binary.file.find_section_by_name(".dynsym").unwrap();
-        let dyn_symbol_table = dyn_symbol_section.get_data(&elf_binary.file).unwrap();
-        let symbols = match dyn_symbol_table {
+        let mut dyn_symbol_section = None;
+        let mut gnu_hash_section = None;
+
+        elf_binary
+            .file
+            .section_iter()
+            .for_each(|elem| {
+           match elem.get_name(&elf_binary.file) {
+               Ok(".dynsym") => {
+                   dyn_symbol_section = Some(elem);
+               }
+               Ok(".gnu.hash") => {
+                   gnu_hash_section = Some(elem);
+               }
+               _ => {}
+           }
+        });
+
+        let dyn_symbol_table = dyn_symbol_section.unwrap().get_data(&elf_binary.file).unwrap();
+
+        let mut symbols = HashMap::new();
+        let mut strings = HashMap::new();
+
+        let mut i = 0;
+
+        match dyn_symbol_table { // FIXME expensive
             SectionData::DynSymbolTable64(entries) => entries
                 .iter()
-                .map(|s| Symbol {
-                    name: elf_binary.symbol_name(s).to_string(),
-                    value: s.value() as usize,
-                })
-                .collect(),
+                .for_each(|s| {
+                    let name = elf_binary.symbol_name(s).to_string();
+                    symbols.insert(
+                        name.clone(),
+                        Symbol {
+                            name: name.clone(),
+                            value: s.value() as usize
+                        }
+                    );
+                    strings.insert(i as usize, name);
+                    i += 1;
+                }),
             SectionData::DynSymbolTable32(entries) => entries
                 .iter()
-                .map(|s| Symbol {
-                    name: elf_binary.symbol_name(s).to_string(),
-                    value: s.value() as usize,
-                })
-                .collect(),
-            _ => Vec::new(),
+                .for_each(|s| {
+                    let name = elf_binary.symbol_name(s).to_string();
+                    symbols.insert(
+                        name.clone(),
+                        Symbol {
+                            name: name.clone(),
+                            value: s.value() as usize
+                        }
+                    );
+                    strings.insert(i, name);
+                    i += 1;
+                }),
+            _ => { }
         };
 
         if let Ok(map) = MmapOptions::new().len(alloc_end - alloc_start).map_anon() {
-            #[cfg(feature = "hacky_hooks")]
-            {
-                hook_manager::set_hooks(
-                    map.as_ptr_range().start as usize..map.as_ptr_range().end as usize,
-                    hooks.clone(),
-                );
-                Ok(AndroidLibrary {
-                    memory_map: map,
-                    symbols,
-                    hooks
-                })
-            }
-            #[cfg(not(feature = "hacky_hooks"))]
-            {
-                hook_manager::add_hooks(hooks);
-                Ok(AndroidLibrary {
-                    memory_map: map,
-                    symbols,
-                })
-            }
+            Ok(AndroidLibrary {
+                memory_map: map,
+                symbols,
+                strings
+            })
         } else {
             Err(ElfLoaderErr::ElfParser {
                 source: "Memory mapping failed!",
@@ -303,118 +285,116 @@ impl ElfLoader<AndroidLibrary> for AndroidLoader {
         Ok(())
     }
 
-    fn relocate(library: &mut AndroidLibrary, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
-        match entry.rtype {
-            RelocationType::x86(relocation) => {
-                let addend = usize::from_ne_bytes(
-                    library.memory_map[entry.offset as usize
-                        ..entry.offset as usize + std::mem::size_of::<usize>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                match relocation {
-                    x86::RelocationTypes::R_386_GLOB_DAT | x86::RelocationTypes::R_386_JMP_SLOT => {
-                        Self::absolute_reloc(library, entry, 0);
-                        Ok(())
-                    }
+    fn relocate(library: &mut AndroidLibrary, entries: Vec<RelocationEntry>) -> Result<(), ElfLoaderErr> {
+        use crate::hook_manager::get_hooks;
 
-                    x86::RelocationTypes::R_386_RELATIVE => {
-                        Self::relative_reloc(library, entry, addend);
-                        Ok(())
-                    }
+        let hooks = get_hooks();
 
-                    x86::RelocationTypes::R_386_32 => {
-                        Self::absolute_reloc(library, entry, addend);
-                        Ok(())
-                    }
+        for entry in entries.iter() {
+            match entry.rtype {
+                RelocationType::x86(relocation) => {
+                    let addend = usize::from_ne_bytes(
+                        library.memory_map[entry.offset as usize
+                            ..entry.offset as usize + std::mem::size_of::<usize>()]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    match relocation {
+                        x86::RelocationTypes::R_386_GLOB_DAT | x86::RelocationTypes::R_386_JMP_SLOT => {
+                            Self::absolute_reloc(library, &hooks, entry, 0);
+                        }
 
-                    _ => {
-                        eprintln!("Unhandled relocation: {:?}", relocation);
-                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
-                    }
-                }
-            }
+                        x86::RelocationTypes::R_386_RELATIVE => {
+                            Self::relative_reloc(library, entry, addend);
+                        }
 
-            RelocationType::x86_64(relocation) => {
-                let addend = entry
-                    .addend
-                    .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
-                    as usize;
-                match relocation {
-                    x86_64::RelocationTypes::R_AMD64_JMP_SLOT
-                    | x86_64::RelocationTypes::R_AMD64_GLOB_DAT
-                    | x86_64::RelocationTypes::R_AMD64_64 => {
-                        Self::absolute_reloc(library, entry, addend);
-                        Ok(())
-                    }
+                        x86::RelocationTypes::R_386_32 => {
+                            Self::absolute_reloc(library, &hooks, entry, addend);
+                        }
 
-                    x86_64::RelocationTypes::R_AMD64_RELATIVE => {
-                        Self::relative_reloc(library, entry, addend);
-                        Ok(())
-                    }
-
-                    _ => {
-                        eprintln!("Unhandled relocation: {:?}", relocation);
-                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                        _ => {
+                            eprintln!("Unhandled relocation: {:?}", relocation);
+                            return Err(ElfLoaderErr::UnsupportedRelocationEntry);
+                        }
                     }
                 }
-            }
 
-            RelocationType::Arm(relocation) => {
-                let addend = usize::from_ne_bytes(
-                    library.memory_map[entry.offset as usize
-                        ..entry.offset as usize + std::mem::size_of::<usize>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                match relocation {
-                    arm::RelocationTypes::R_ARM_GLOB_DAT
-                    | arm::RelocationTypes::R_ARM_JUMP_SLOT => {
-                        Self::absolute_reloc(library, entry, 0);
-                        Ok(())
-                    }
+                RelocationType::x86_64(relocation) => {
+                    let addend = entry
+                        .addend
+                        .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
+                        as usize;
+                    match relocation {
+                        x86_64::RelocationTypes::R_AMD64_JMP_SLOT
+                        | x86_64::RelocationTypes::R_AMD64_GLOB_DAT
+                        | x86_64::RelocationTypes::R_AMD64_64 => {
+                            Self::absolute_reloc(library, &hooks, entry, addend);
+                        }
 
-                    arm::RelocationTypes::R_ARM_RELATIVE => {
-                        Self::relative_reloc(library, entry, addend);
-                        Ok(())
-                    }
+                        x86_64::RelocationTypes::R_AMD64_RELATIVE => {
+                            Self::relative_reloc(library, entry, addend);
+                        }
 
-                    arm::RelocationTypes::R_ARM_ABS32 => {
-                        Self::absolute_reloc(library, entry, addend);
-                        Ok(())
-                    }
-
-                    _ => {
-                        eprintln!("Unhandled relocation: {:?}", relocation);
-                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                        _ => {
+                            eprintln!("Unhandled relocation: {:?}", relocation);
+                            return Err(ElfLoaderErr::UnsupportedRelocationEntry);
+                        }
                     }
                 }
-            }
 
-            RelocationType::AArch64(relocation) => {
-                let addend = entry
-                    .addend
-                    .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
-                    as usize;
-                match relocation {
-                    aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT
-                    | aarch64::RelocationTypes::R_AARCH64_GLOB_DAT
-                    | aarch64::RelocationTypes::R_AARCH64_ABS64 => {
-                        Self::absolute_reloc(library, entry, addend);
-                        Ok(())
+                RelocationType::Arm(relocation) => {
+                    let addend = usize::from_ne_bytes(
+                        library.memory_map[entry.offset as usize
+                            ..entry.offset as usize + std::mem::size_of::<usize>()]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    match relocation {
+                        arm::RelocationTypes::R_ARM_GLOB_DAT
+                        | arm::RelocationTypes::R_ARM_JUMP_SLOT => {
+                            Self::absolute_reloc(library, &hooks, entry, 0);
+                        }
+
+                        arm::RelocationTypes::R_ARM_RELATIVE => {
+                            Self::relative_reloc(library, entry, addend);
+                        }
+
+                        arm::RelocationTypes::R_ARM_ABS32 => {
+                            Self::absolute_reloc(library, &hooks, entry, addend);
+                        }
+
+                        _ => {
+                            eprintln!("Unhandled relocation: {:?}", relocation);
+                            return Err(ElfLoaderErr::UnsupportedRelocationEntry);
+                        }
                     }
+                }
 
-                    aarch64::RelocationTypes::R_AARCH64_RELATIVE => {
-                        Self::relative_reloc(library, entry, addend);
-                        Ok(())
-                    }
+                RelocationType::AArch64(relocation) => {
+                    let addend = entry
+                        .addend
+                        .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?
+                        as usize;
+                    match relocation {
+                        aarch64::RelocationTypes::R_AARCH64_JUMP_SLOT
+                        | aarch64::RelocationTypes::R_AARCH64_GLOB_DAT
+                        | aarch64::RelocationTypes::R_AARCH64_ABS64 => {
+                            Self::absolute_reloc(library, &hooks, entry, addend);
+                        }
 
-                    _ => {
-                        eprintln!("Unhandled relocation: {:?}", relocation);
-                        Err(ElfLoaderErr::UnsupportedRelocationEntry)
+                        aarch64::RelocationTypes::R_AARCH64_RELATIVE => {
+                            Self::relative_reloc(library, entry, addend);
+                        }
+
+                        _ => {
+                            eprintln!("Unhandled relocation: {:?}", relocation);
+                            return Err(ElfLoaderErr::UnsupportedRelocationEntry);
+                        }
                     }
                 }
             }
         }
+
+        Ok(())
     }
 }

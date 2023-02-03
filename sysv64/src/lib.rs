@@ -13,7 +13,7 @@ pub fn sysv64_type(input: TokenStream) -> TokenStream {
 
 fn sysv64_str(input: TokenStream) -> String {
     let mut output = String::new();
-    let mut input = input.to_string();
+    let input = input.to_string();
 
     let input_splitted: Vec<&str> = input.split("fn").collect();
 
