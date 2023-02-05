@@ -14,10 +14,8 @@ pub fn get_hooks<'a>() -> MutexGuard<'a, HashMap<String, usize>> {
 
 /// Add a list of hooks to the global list
 pub fn add_hooks(hooks: HashMap<String, usize>) {
-    println!("LOCK add_hooks [");
     let mut global_hooks = HOOKS.lock().unwrap();
     for (key, value) in hooks.iter() {
         global_hooks.insert(key.clone(), *value);
     }
-    println!("] // add_hooks");
 }
