@@ -3,6 +3,7 @@ extern crate core;
 pub mod android_library;
 pub mod android_loader;
 pub mod hook_manager;
+mod relocation_types;
 
 pub use sysv64::*;
 
@@ -14,7 +15,7 @@ mod tests {
     use std::os::raw::c_char;
     use libc::{chmod, close, free, fstat, ftruncate, gettimeofday, lstat, malloc, mkdir, open, read, strncpy, umask, write};
 
-    use crate::android_loader::AndroidLoader;
+    use crate::android_library::AndroidLibrary;
     use crate::{sysv64, sysv64_type};
 
     #[sysv64]
@@ -43,7 +44,7 @@ mod tests {
         crate::hook_manager::add_hooks(hooks);
 
         let store_services_core =
-            AndroidLoader::load_library("lib/x86_64/libstoreservicescore.so")
+            AndroidLibrary::load("lib/x86_64/libstoreservicescore.so")
                 .expect("Cannot load StoreServicesCore");
 
         println!("Library loaded. Let's start.");
