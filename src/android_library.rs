@@ -8,26 +8,84 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
-use std::fs;
+use std::{fs, slice};
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use xmas_elf::ElfFile;
 use xmas_elf::program::{ProgramHeader, Type};
 use xmas_elf::sections::{SectionData, SectionHeader, ShType};
-use xmas_elf::symbol_table::{DynEntry64, Entry};
+use xmas_elf::symbol_table::{DynEntry64, DynEntry32, Entry};
+use zero::{read, read_str};
+
 use crate::hook_manager::get_hooks;
 use crate::relocation_types::{RelocationType, RelocType};
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+type DynEntry = DynEntry64;
+#[cfg(any(target_arch = "x86", target_arch = "arm"))]
+type DynEntry = DynEntry32;
+
+// GnuHashTable adapted from goblin code
+
 #[repr(C)]
-struct GnuHashTable {
-    pub(crate) nbuckets: u32,
-    pub(crate) symoffset: u32,
-    pub(crate) bloom_size: u32,
-    pub(crate) bloom_shift: u32
+pub(crate) struct GnuHashTable<'a> {
+    /// Index of the first symbol in the `.dynsym` table which is accessible with
+    /// the hash table
+    symindex: u32,
+    /// Shift count used in the bloom filter
+    shift2: u32,
+    /// 2 bit bloom filter on `chains`
+    // Either 32 or 64-bit depending on the class of object
+    bloom_filter: &'a [usize],
+    /// GNU hash table bucket array; indexes start at 0. This array holds symbol
+    /// table indexes and contains the index of hashes in `chains`
+    buckets: &'a [u32],
+    /// Hash values; indexes start at 0. This array holds symbol table indexes.
+    chains: &'a [u32], // => chains[dynsyms.len() - symindex]
+    dynsyms: &'a [DynEntry],
 }
 
-impl GnuHashTable {
+impl<'a> GnuHashTable<'a> {
+    unsafe fn new(hashtab: &'a [u8], dynsyms: &'a [DynEntry]) -> GnuHashTable<'a> {
+        let [nbuckets, symindex, maskwords, shift2] =
+            (hashtab.as_ptr() as *const u32 as *const [u32; 4]).read();
+
+        let hashtab = &hashtab[16..];
+        {
+            // SAFETY: Condition to check for an overflow
+            //   size_of(chains) + size_of(buckets) + size_of(bloom_filter) == size_of(hashtab)
+            const U32_SIZE: usize = std::mem::size_of::<u32>();
+            const INT_SIZE: usize = std::mem::size_of::<isize>();
+
+            let chains_size = (dynsyms.len() - symindex as usize).checked_mul(U32_SIZE);
+            let buckets_size = (nbuckets as usize).checked_mul(U32_SIZE);
+            let bloom_size = (maskwords as usize).checked_mul(INT_SIZE);
+
+            let total_size = match (chains_size, buckets_size, bloom_size) {
+                (Some(a), Some(b), Some(c)) => {
+                    a.checked_add(b).and_then(|t| t.checked_add(c))
+                }
+                _ => None,
+            };
+        }
+
+        let bloom_filter_ptr = hashtab.as_ptr() as *const usize;
+        let buckets_ptr = bloom_filter_ptr.add(maskwords as usize) as *const u32;
+        let chains_ptr = buckets_ptr.add(nbuckets as usize);
+        let bloom_filter = slice::from_raw_parts(bloom_filter_ptr, maskwords as usize);
+        let buckets = slice::from_raw_parts(buckets_ptr, nbuckets as usize);
+        let chains = slice::from_raw_parts(chains_ptr, dynsyms.len() - symindex as usize);
+        Self {
+            symindex,
+            shift2,
+            bloom_filter,
+            buckets,
+            chains,
+            dynsyms,
+        }
+    }
+
     fn hash(symbol_name: &str) -> u32 {
         let mut h: u32 = 5381;
 
@@ -38,31 +96,55 @@ impl GnuHashTable {
         h
     }
 
-    pub fn lookup(&self, symbol_name: &str) -> u32 {
-        0
+    pub unsafe fn lookup(&self, android_library: &AndroidLibrary, symbol: &str, dynstrtab: &[u8]) -> Option<*const ()> {
+        let hash = Self::hash(symbol);
+
+        const MASK_LOWEST_BIT: u32 = 0xffff_fffe;
+        let bucket = self.buckets[hash as usize % self.buckets.len()];
+
+        // Empty hash chain, symbol not present
+        if bucket < self.symindex {
+            return None;
+        }
+        // Walk the chain until the symbol is found or the chain is exhausted.
+        let chain_idx = bucket - self.symindex;
+        let hash = hash & MASK_LOWEST_BIT;
+        let chains = &self.chains.get((chain_idx as usize)..)?;
+        let dynsyms = &self.dynsyms.get((bucket as usize)..)?;
+        for (hash2, symb) in chains.iter().zip(dynsyms.iter()) {
+            if (hash == (hash2 & MASK_LOWEST_BIT))
+                && (symbol == read_str(&dynstrtab[(symb.name() as usize)..]))
+            {
+                return Some(android_library.memory_map.as_ptr().offset(symb.value() as isize) as *const ());
+            }
+            // Chain ends with an element with the lowest bit set to 1.
+            if hash2 & 1 == 1 {
+                break;
+            }
+        }
+        None
     }
 }
 
 pub struct AndroidLibrary<'a> {
-    pub(crate) file: Vec<u8>,
-    pub(crate) elf_file: ElfFile<'a>,
+    pub(crate) file: Box<Vec<u8>>,
     pub(crate) memory_map: MmapMut,
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    pub(crate) dyn_symbols: &'a [DynEntry64],
-    #[cfg(any(target_arch = "x86", target_arch = "arm"))]
-    pub(crate) dyn_symbols: &'a [DynEntry32],
-    pub(crate) gnu_hash_table: Option<*const GnuHashTable>
+    pub(crate) dyn_symbols: &'a [DynEntry],
+    pub(crate) dyn_strs: &'a [u8],
+    pub(crate) gnu_hash_table: Option<GnuHashTable<'a>>
 }
 
 impl AndroidLibrary<'_> {
     pub fn get_symbol(&self, symbol_name: &str) -> Option<*const ()> {
-        match self.gnu_hash_table {
+        let elf_file = ElfFile::new(&self.file).unwrap();
+        match &self.gnu_hash_table {
             Some(hash_table) => {
-                self.dyn_symbols.iter().find(|sym| sym.get_name(&self.elf_file) == Ok(symbol_name)).map(|s| s.value() as *const ())
+                unsafe {
+                    hash_table.lookup(&self, symbol_name, self.dyn_strs)
+                }
             }
-            None => self.dyn_symbols.iter().find(|sym| sym.get_name(&self.elf_file) == Ok(symbol_name)).map(|s| s.value() as *const ())
+            None => unsafe { self.dyn_symbols.iter().find(|sym| sym.get_name(&elf_file) == Ok(symbol_name)).map(|s| self.memory_map.as_ptr().offset(s.value() as isize) as *const ()) }
         }
-        // the typically way to do this uses hashes, but this works fine if not maximally efficient
     }
     #[sysv64]
     fn pthread_stub() -> i32 {
@@ -137,9 +219,10 @@ impl AndroidLibrary<'_> {
         }
     }
 
-    fn absolute_reloc<T: Entry>(elf_file: &ElfFile, memory_map: &mut MmapMut, dynsym: &[T], hooks: &HashMap<String, usize>, index: usize, offset: usize, addend: usize) {
-        let name = dynsym[index].get_name(elf_file);
-        let symbol = Self::symbol_finder(name.unwrap(), hooks);
+    fn absolute_reloc<T: Entry>(elf_file: &ElfFile, memory_map: &mut MmapMut, dynsym: &[T], dynstrings: &[u8], hooks: &HashMap<String, usize>, index: usize, offset: usize, addend: usize) {
+        let name =
+            read_str(&dynstrings[(dynsym[index].name() as usize)..]);
+        let symbol = Self::symbol_finder(name, hooks);
 
         // addend is always 0, but we still add it to be safe
         // converted to an array in the systme endianess
@@ -161,8 +244,11 @@ impl AndroidLibrary<'_> {
     #[cfg(target_arch="aarch64")]
     const MAX_PAGE_SIZE: usize = 65536;
 
-    pub fn load(path: &str) -> Result<AndroidLibrary> {
-        let elf_file = ElfFile::new(fs::read(path)?).map_err(|err| AndroidLoaderErr::ElfParsingError(err.to_string()))?;
+    pub fn load<'a>(path: &str) -> Result<AndroidLibrary<'a>> {
+        let file = Box::new(fs::read(path)?);
+        let file_leak_ptr = Box::into_raw(file);
+        let file_leak = unsafe { file_leak_ptr.as_ref().unwrap() };
+        let elf_file = ElfFile::new(&file_leak).map_err(|err| AndroidLoaderErr::ElfParsingError(err.to_string()))?;
 
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
@@ -244,13 +330,18 @@ impl AndroidLibrary<'_> {
         }
 
         let hooks = get_hooks();
-        let mut dyn_symbols: &[DynEntry64] = &[];
+        let mut dyn_symbols: &[DynEntry] = &[];
+        let mut dyn_strings: &[u8] = &[];
         let mut gnu_hash_table = None;
+
         for section in elf_file.section_iter() {
             match section.get_type() {
-                Ok(ShType::Hash) => {
-                    if section.get_name(&elf_file) == Ok(".gnu.hash") {
-                        gnu_hash_table = Some(section.address() as *const GnuHashTable);
+                Ok(ShType::OsSpecific(0x6FFFFFF6)) => unsafe {
+                    gnu_hash_table = Some(GnuHashTable::new(section.raw_data(&elf_file), dyn_symbols));
+                }
+                Ok(ShType::StrTab) => {
+                    if section.get_name(&elf_file) == Ok(".dynstr") {
+                        dyn_strings = section.raw_data(&elf_file);
                     }
                 }
                 Ok(ShType::DynSym) => {
@@ -269,7 +360,7 @@ impl AndroidLibrary<'_> {
                             for relocation in relocations {
                                 match RelocationType::from(relocation.get_type()) {
                                     RelocationType::Absolute | RelocationType::GlobalData | RelocationType::JumpSlot => {
-                                        Self::absolute_reloc(&elf_file, &mut memory_map, dyn_symbols, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, relocation.get_addend() as usize);
+                                        Self::absolute_reloc(&elf_file, &mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, relocation.get_addend() as usize);
                                     }
                                     RelocationType::Relative => {
                                         Self::relative_reloc(&mut memory_map, relocation.get_offset() as usize, relocation.get_addend() as usize);
@@ -314,12 +405,12 @@ impl AndroidLibrary<'_> {
             }
         }
 
-        let mut android_library = AndroidLibrary {
-            file,
-            elf_file,
+        let android_library = AndroidLibrary {
+            file: unsafe { Box::from_raw(file_leak_ptr) },
             memory_map,
             gnu_hash_table,
-            dyn_symbols
+            dyn_symbols,
+            dyn_strs: dyn_strings
         };
 
         Ok(android_library)
