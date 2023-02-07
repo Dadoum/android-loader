@@ -5,7 +5,14 @@ pub mod android_loader;
 pub mod hook_manager;
 mod relocation_types;
 
-pub use sysv64::*;
+pub use sysv64::sysv64;
+
+#[cfg(all(target_family = "windows", target_arch = "x86_64"))]
+pub use sysv64::sysved64_type as sysv64_type;
+
+#[cfg(not(all(target_family = "windows", target_arch = "x86_64")))]
+pub use sysv64::sysvno64_type as sysv64_type;
+
 
 #[cfg(test)]
 mod tests {

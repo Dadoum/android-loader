@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use std::{arch::asm, collections::HashMap, ops::Range, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 use std::sync::MutexGuard;
 
 lazy_static! {

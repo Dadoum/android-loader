@@ -1,4 +1,3 @@
-use crate::hook_manager;
 use crate::sysv64;
 use anyhow::Result;
 use memmap2::{MmapOptions, MmapMut};
@@ -10,21 +9,20 @@ use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
 use std::{fs, slice};
 use std::os::raw::{c_char, c_void};
-use std::path::PathBuf;
 use std::ptr::null_mut;
 use xmas_elf::ElfFile;
 use xmas_elf::program::{ProgramHeader, Type};
-use xmas_elf::sections::{SectionData, SectionHeader, ShType};
-use xmas_elf::symbol_table::{DynEntry64, DynEntry32, Entry};
-use zero::{read, read_str};
+use xmas_elf::sections::{SectionData, ShType};
+use xmas_elf::symbol_table::Entry;
+use zero::read_str;
 
 use crate::hook_manager::get_hooks;
 use crate::relocation_types::{RelocationType, RelocType};
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-type DynEntry = DynEntry64;
+type DynEntry = xmas_elf::symbol_table::DynEntry64;
 #[cfg(any(target_arch = "x86", target_arch = "arm"))]
-type DynEntry = DynEntry32;
+type DynEntry = xmas_elf::symbol_table::DynEntry32;
 
 // GnuHashTable adapted from goblin code
 
@@ -52,23 +50,6 @@ impl<'a> GnuHashTable<'a> {
             (hashtab.as_ptr() as *const u32 as *const [u32; 4]).read();
 
         let hashtab = &hashtab[16..];
-        {
-            // SAFETY: Condition to check for an overflow
-            //   size_of(chains) + size_of(buckets) + size_of(bloom_filter) == size_of(hashtab)
-            const U32_SIZE: usize = std::mem::size_of::<u32>();
-            const INT_SIZE: usize = std::mem::size_of::<isize>();
-
-            let chains_size = (dynsyms.len() - symindex as usize).checked_mul(U32_SIZE);
-            let buckets_size = (nbuckets as usize).checked_mul(U32_SIZE);
-            let bloom_size = (maskwords as usize).checked_mul(INT_SIZE);
-
-            let total_size = match (chains_size, buckets_size, bloom_size) {
-                (Some(a), Some(b), Some(c)) => {
-                    a.checked_add(b).and_then(|t| t.checked_add(c))
-                }
-                _ => None,
-            };
-        }
 
         let bloom_filter_ptr = hashtab.as_ptr() as *const usize;
         let buckets_ptr = bloom_filter_ptr.add(maskwords as usize) as *const u32;
@@ -219,7 +200,7 @@ impl AndroidLibrary<'_> {
         }
     }
 
-    fn absolute_reloc<T: Entry>(elf_file: &ElfFile, memory_map: &mut MmapMut, dynsym: &[T], dynstrings: &[u8], hooks: &HashMap<String, usize>, index: usize, offset: usize, addend: usize) {
+    fn absolute_reloc<T: Entry>(memory_map: &mut MmapMut, dynsym: &[T], dynstrings: &[u8], hooks: &HashMap<String, usize>, index: usize, offset: usize, addend: usize) {
         let name =
             read_str(&dynstrings[(dynsym[index].name() as usize)..]);
         let symbol = Self::symbol_finder(name, hooks);
@@ -360,7 +341,7 @@ impl AndroidLibrary<'_> {
                             for relocation in relocations {
                                 match RelocationType::from(relocation.get_type()) {
                                     RelocationType::Absolute | RelocationType::GlobalData | RelocationType::JumpSlot => {
-                                        Self::absolute_reloc(&elf_file, &mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, relocation.get_addend() as usize);
+                                        Self::absolute_reloc(&mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, relocation.get_addend() as usize);
                                     }
                                     RelocationType::Relative => {
                                         Self::relative_reloc(&mut memory_map, relocation.get_offset() as usize, relocation.get_addend() as usize);
@@ -373,27 +354,26 @@ impl AndroidLibrary<'_> {
                         }
                         #[cfg(any(target_arch = "x86", target_arch = "arm"))]
                         Ok(SectionData::Rel32(relocations)) => {
-                            let addend = usize::from_ne_bytes(
-                                library.memory_map[entry.offset as usize
-                                    ..entry.offset as usize + std::mem::size_of::<usize>()]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            for relocation in relocations.iter() {
-                                for relocation in relocations {
-                                    match RelocationType::from(relocation.get_type()) {
-                                        RelocationType::Absolute => {
-                                            Self::absolute_reloc(&mut android_library, dyn_symbol_section.unwrap(), &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, 0);
-                                        }
-                                        RelocationType::GlobalData | RelocationType::JumpSlot => {
-                                            Self::absolute_reloc(&mut android_library, dyn_symbol_section.unwrap(), &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, addend);
-                                        }
-                                        RelocationType::Relative => {
-                                            Self::relative_reloc(&mut android_library, relocation.get_offset() as usize, addend);
-                                        }
-                                        RelocationType::Unknown(reloc_number) => {
-                                            return Err(AndroidLoaderErr::UnsupportedRelocation(reloc_number).into());
-                                        }
+                            for relocation in relocations {
+                                let offset = relocation.get_offset() as usize;
+                                let addend = usize::from_ne_bytes(
+                                    memory_map[offset
+                                        ..offset + std::mem::size_of::<usize>()]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                match RelocationType::from(relocation.get_type()) {
+                                    RelocationType::Absolute => {
+                                        Self::absolute_reloc(&mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, offset, 0);
+                                    }
+                                    RelocationType::GlobalData | RelocationType::JumpSlot => {
+                                        Self::absolute_reloc(&mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, offset, addend);
+                                    }
+                                    RelocationType::Relative => {
+                                        Self::relative_reloc(&mut memory_map, offset, addend);
+                                    }
+                                    RelocationType::Unknown(reloc_number) => {
+                                        return Err(AndroidLoaderErr::UnsupportedRelocation(reloc_number).into());
                                     }
                                 }
                             }
