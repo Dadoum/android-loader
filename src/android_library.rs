@@ -238,7 +238,7 @@ impl AndroidLibrary<'_> {
             if header.get_type() == Ok(Type::Load) {
                 let start = region::page::floor(header.virtual_addr() as *const ()) as usize;
                 let end = region::page::ceil(
-                    (start as usize + max(header.file_size(), header.mem_size()) as usize)
+                    (header.virtual_addr() as usize + max(header.file_size(), header.mem_size()) as usize)
                         as *const (),
                 ) as usize;
 
