@@ -1,5 +1,6 @@
 use crate::sysv64;
 use anyhow::Result;
+use log::{debug, info};
 use memmap2::{MmapOptions, MmapMut};
 use region::Protection;
 use std::cmp::max;
@@ -154,7 +155,7 @@ impl AndroidLibrary<'_> {
             path_str = _path.as_str();
         }
 
-        println!("Loading {}", path_str);
+        info!("Loading {}", path_str);
         match Self::load(path_str) {
             Ok(lib) => Box::into_raw(Box::new(lib)) as *mut c_void,
             Err(_) => null_mut(),
@@ -164,7 +165,7 @@ impl AndroidLibrary<'_> {
     #[sysv64]
     unsafe fn dlsym(library: *mut AndroidLibrary, symbol: *const c_char) -> *mut c_void {
         let symbol = CStr::from_ptr(symbol).to_str().unwrap();
-        println!("Symbol requested: {}", symbol);
+        debug!("Symbol requested: {}", symbol);
         match library.as_ref().and_then(|lib| lib.get_symbol(symbol)) {
             Some(func) => func as *mut c_void,
             None => null_mut(),
@@ -271,7 +272,7 @@ impl AndroidLibrary<'_> {
 
                 let start_addr = region::page::floor((addr + virtual_addr) as *const c_void) as *mut c_void;
                 let end_addr = region::page::ceil((addr + virtual_addr + mem_size) as *const c_void);
-                print!(
+                let mut header_debug = format!(
                     "{:x} - {:x} (mem_sz: {}, file_sz: {}) [",
                     start_addr as usize, end_addr as usize, mem_size, file_size
                 );
@@ -281,23 +282,24 @@ impl AndroidLibrary<'_> {
                 let flags = program_header.flags();
                 let mut prot = Protection::NONE.bits();
                 if flags.is_read() || !is_standard_page {
-                    print!("R");
+                    header_debug += "R";
                     prot |= Protection::READ.bits();
                 } else {
-                    print!("-");
+                    header_debug += "-";
                 }
                 if flags.is_write() || !is_standard_page {
-                    print!("W");
+                    header_debug += "W";
                     prot |= Protection::WRITE.bits();
                 } else {
-                    print!("-");
+                    header_debug += "-";
                 }
                 if flags.is_execute() || !is_standard_page {
-                    println!("X]");
+                    header_debug += "X]";
                     prot |= Protection::EXECUTE.bits();
                 } else {
-                    println!("-]");
+                    header_debug += "-]";
                 }
+                debug!("{header_debug}");
                 memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(data);
 
                 unsafe {
