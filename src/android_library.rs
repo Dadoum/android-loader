@@ -97,7 +97,7 @@ impl<'a> GnuHashTable<'a> {
             if (hash == (hash2 & MASK_LOWEST_BIT))
                 && (symbol == read_str(&dynstrtab[(symb.name() as usize)..]))
             {
-                return Some(android_library.memory_map.as_ptr().offset(symb.value() as isize) as *const ());
+                return Some(android_library.memory_map.as_ptr().offset((symb.value() as usize + android_library.alignment_offset) as isize) as *const ());
             }
             // Chain ends with an element with the lowest bit set to 1.
             if hash2 & 1 == 1 {
@@ -113,6 +113,7 @@ pub struct AndroidLibrary<'a> {
     pub(crate) memory_map: MmapMut,
     pub(crate) dyn_symbols: &'a [DynEntry],
     pub(crate) dyn_strs: &'a [u8],
+    pub(crate) alignment_offset: usize,
     pub(crate) gnu_hash_table: Option<GnuHashTable<'a>>
 }
 
@@ -125,7 +126,7 @@ impl AndroidLibrary<'_> {
                     hash_table.lookup(&self, symbol_name, self.dyn_strs)
                 }
             }
-            None => unsafe { self.dyn_symbols.iter().find(|sym| sym.get_name(&elf_file) == Ok(symbol_name)).map(|s| self.memory_map.as_ptr().offset(s.value() as isize) as *const ()) }
+            None => unsafe { self.dyn_symbols.iter().find(|sym| sym.get_name(&elf_file) == Ok(symbol_name)).map(|s| self.memory_map.as_ptr().offset((s.value() as usize + self.alignment_offset) as isize) as *const ()) }
         }
     }
     #[sysv64]
@@ -398,7 +399,7 @@ impl AndroidLibrary<'_> {
                         #[cfg(any(target_arch = "x86", target_arch = "arm"))]
                         Ok(SectionData::Rel32(relocations)) => {
                             for relocation in relocations {
-                                let offset = relocation.get_offset() as usize;
+                                let offset = relocation.get_offset() as usize + offset;
                                 let addend = usize::from_ne_bytes(
                                     memory_map[offset
                                         ..offset + std::mem::size_of::<usize>()]
@@ -433,6 +434,7 @@ impl AndroidLibrary<'_> {
             memory_map,
             gnu_hash_table,
             dyn_symbols,
+            alignment_offset: offset,
             dyn_strs: dyn_strings
         };
 
