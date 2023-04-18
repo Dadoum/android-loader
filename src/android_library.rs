@@ -1,8 +1,8 @@
 use crate::sysv64;
 use anyhow::Result;
-use log::{debug, info};
+use log::{debug, info, warn};
 use memmap2::{MmapOptions, MmapMut};
-use region::Protection;
+use region::{page, Protection};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::error::Error;
@@ -97,7 +97,7 @@ impl<'a> GnuHashTable<'a> {
             if (hash == (hash2 & MASK_LOWEST_BIT))
                 && (symbol == read_str(&dynstrtab[(symb.name() as usize)..]))
             {
-                return Some(android_library.memory_map.as_ptr().offset(symb.value() as isize) as *const ());
+                return Some(android_library.memory_map.as_ptr().offset((symb.value() as usize + android_library.alignment_offset) as isize) as *const ());
             }
             // Chain ends with an element with the lowest bit set to 1.
             if hash2 & 1 == 1 {
@@ -113,6 +113,7 @@ pub struct AndroidLibrary<'a> {
     pub(crate) memory_map: MmapMut,
     pub(crate) dyn_symbols: &'a [DynEntry],
     pub(crate) dyn_strs: &'a [u8],
+    pub(crate) alignment_offset: usize,
     pub(crate) gnu_hash_table: Option<GnuHashTable<'a>>
 }
 
@@ -125,7 +126,7 @@ impl AndroidLibrary<'_> {
                     hash_table.lookup(&self, symbol_name, self.dyn_strs)
                 }
             }
-            None => unsafe { self.dyn_symbols.iter().find(|sym| sym.get_name(&elf_file) == Ok(symbol_name)).map(|s| self.memory_map.as_ptr().offset(s.value() as isize) as *const ()) }
+            None => unsafe { self.dyn_symbols.iter().find(|sym| sym.get_name(&elf_file) == Ok(symbol_name)).map(|s| self.memory_map.as_ptr().offset((s.value() as usize + self.alignment_offset) as isize) as *const ()) }
         }
     }
     #[sysv64]
@@ -235,13 +236,41 @@ impl AndroidLibrary<'_> {
         let mut minimum = usize::MAX;
         let mut maximum = usize::MIN;
 
+        let mut is_incompatible = false;
+        let mut offset = 0;
+        let mut overall_protection = Protection::NONE;
+
         for header in elf_file.program_iter() {
             if header.get_type() == Ok(Type::Load) {
+                let flags = header.flags();
+
                 let start = region::page::floor(header.virtual_addr() as *const ()) as usize;
                 let end = region::page::ceil(
-                    (header.virtual_addr() as usize + max(header.file_size(), header.mem_size()) as usize)
+                    (header.virtual_addr() as usize + header.mem_size() as usize)
                         as *const (),
                 ) as usize;
+
+                if offset == 0 {
+                    let mut prot = Protection::NONE.bits();
+                    if flags.is_read() {
+                        prot |= Protection::READ.bits();
+                    }
+                    if flags.is_write() {
+                        prot |= Protection::WRITE.bits();
+                    }
+                    if flags.is_execute() {
+                        prot |= Protection::EXECUTE.bits();
+                    }
+                    overall_protection |= Protection::from_bits_truncate(prot);
+                    if overall_protection == Protection::READ_WRITE_EXECUTE {
+                        offset = page::ceil(start as *const ()) as usize - start;
+                    }
+                }
+
+                if !is_incompatible && page::ceil(maximum as *const ()) as usize > start {
+                    is_incompatible = true;
+                    warn!("library has not been made for this CPU. It may crash!");
+                }
 
                 if start < minimum {
                     minimum = start;
@@ -256,7 +285,12 @@ impl AndroidLibrary<'_> {
         let alloc_start = region::page::floor(minimum as *const ()) as usize;
         let alloc_end = region::page::ceil(maximum as *const ()) as usize;
 
+        if !is_incompatible {
+            offset = 0;
+        }
+
         let mut memory_map = MmapOptions::new().len(alloc_end - alloc_start).map_anon()?;
+        let addr = memory_map.as_ptr() as usize + offset;
 
         for program_header in elf_file.program_iter() {
             if program_header.get_type() == Ok(Type::Load) {
@@ -268,7 +302,6 @@ impl AndroidLibrary<'_> {
                 let virtual_addr = program_header.virtual_addr() as usize;
                 let mem_size = program_header.mem_size() as usize;
                 let file_size = program_header.file_size() as usize;
-                let addr = memory_map.as_ptr() as usize;
 
                 let start_addr = region::page::floor((addr + virtual_addr) as *const c_void) as *mut c_void;
                 let end_addr = region::page::ceil((addr + virtual_addr + mem_size) as *const c_void);
@@ -300,13 +333,22 @@ impl AndroidLibrary<'_> {
                     header_debug += "-]";
                 }
                 debug!("{header_debug}");
+
+                unsafe {
+                    region::protect(
+                        start_addr,
+                        end_addr as usize - start_addr as usize,
+                        Protection::READ_WRITE,
+                    )?;
+                }
+
                 memory_map[virtual_addr..virtual_addr + file_size].copy_from_slice(data);
 
                 unsafe {
                     region::protect(
                         start_addr,
                         end_addr as usize - start_addr as usize,
-                        Protection::from_bits_truncate(prot),
+                        Protection::from_bits_truncate(prot) | Protection::READ,
                     )?;
                 }
             }
@@ -343,10 +385,10 @@ impl AndroidLibrary<'_> {
                             for relocation in relocations {
                                 match RelocationType::from(relocation.get_type()) {
                                     RelocationType::Absolute | RelocationType::GlobalData | RelocationType::JumpSlot => {
-                                        Self::absolute_reloc(&mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize, relocation.get_addend() as usize);
+                                        Self::absolute_reloc(&mut memory_map, dyn_symbols, dyn_strings, &hooks, relocation.get_symbol_table_index() as usize, relocation.get_offset() as usize + offset, relocation.get_addend() as usize);
                                     }
                                     RelocationType::Relative => {
-                                        Self::relative_reloc(&mut memory_map, relocation.get_offset() as usize, relocation.get_addend() as usize);
+                                        Self::relative_reloc(&mut memory_map, relocation.get_offset() as usize + offset, relocation.get_addend() as usize);
                                     }
                                     RelocationType::Unknown(reloc_number) => {
                                         return Err(AndroidLoaderErr::UnsupportedRelocation(reloc_number).into());
@@ -357,7 +399,7 @@ impl AndroidLibrary<'_> {
                         #[cfg(any(target_arch = "x86", target_arch = "arm"))]
                         Ok(SectionData::Rel32(relocations)) => {
                             for relocation in relocations {
-                                let offset = relocation.get_offset() as usize;
+                                let offset = relocation.get_offset() as usize + offset;
                                 let addend = usize::from_ne_bytes(
                                     memory_map[offset
                                         ..offset + std::mem::size_of::<usize>()]
@@ -392,6 +434,7 @@ impl AndroidLibrary<'_> {
             memory_map,
             gnu_hash_table,
             dyn_symbols,
+            alignment_offset: offset,
             dyn_strs: dyn_strings
         };
 
